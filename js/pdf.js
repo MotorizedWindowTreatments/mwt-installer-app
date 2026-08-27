@@ -1,0 +1,404 @@
+/* ============================================================
+   MWT Installer Order Manager - pdf.js
+   Builds a readable PDF from a job + its form schema.
+   Labels and answers are always kept on the same line, e.g.
+   "Tall Ladder / Concrete / Remove: 12 / 2 / 15" - never split
+   across the page the way the old website PDFs were.
+   ============================================================ */
+
+function buildJobPdfBlob(job, schema) {
+  const { jsPDF } = window.jspdf;
+  const wide = schema.lineItems && schema.lineItems.columns.length > 8;
+  const doc = new jsPDF({ orientation: wide ? "landscape" : "portrait", unit: "pt", format: "letter" });
+
+  const marginX = 36;
+  let y = 40;
+  const pageWidth = doc.internal.pageSize.getWidth();
+  const pageHeight = doc.internal.pageSize.getHeight();
+
+  function ensureSpace(h) {
+    if (y + h > pageHeight - 50) {
+      doc.addPage();
+      y = 40;
+    }
+  }
+
+  function drawHeader() {
+    doc.setFillColor(22, 35, 63); // navy
+    doc.rect(0, 0, pageWidth, 54, "F");
+    doc.setTextColor(255, 255, 255);
+    doc.setFont("helvetica", "bold");
+    doc.setFontSize(16);
+    doc.text("Motorized Window Treatments", marginX, 22);
+    doc.setFontSize(11);
+    doc.setFont("helvetica", "normal");
+    doc.text(schema.pdfTitle, marginX, 40);
+
+    doc.setFontSize(10);
+    const rightLines = [
+      "MWT Project #: " + (job.projectNumber || "\u2014"),
+      "Status: " + job.status.toUpperCase(),
+      "Generated: " + new Date().toLocaleString()
+    ];
+    rightLines.forEach((line, i) => {
+      doc.text(line, pageWidth - marginX, 16 + i * 12, { align: "right" });
+    });
+    doc.setTextColor(0, 0, 0);
+    y = 70;
+  }
+
+  function sectionTitle(title) {
+    ensureSpace(26);
+    doc.setFillColor(22, 35, 63);
+    doc.rect(marginX, y, pageWidth - marginX * 2, 18, "F");
+    doc.setTextColor(255, 255, 255);
+    doc.setFont("helvetica", "bold");
+    doc.setFontSize(10.5);
+    doc.text(title.toUpperCase(), marginX + 6, y + 13);
+    doc.setTextColor(0, 0, 0);
+    y += 26;
+  }
+
+  // Label: value, wrapped, kept together so the answer is never far
+  // from its label (this was the #1 complaint about the old PDFs).
+  function labelValueLine(label, value) {
+    const text = label + ": " + (value && value.toString().trim() ? value : "\u2014");
+    doc.setFont("helvetica", "normal");
+    doc.setFontSize(9.5);
+    const usableWidth = pageWidth - marginX * 2;
+    const lines = doc.splitTextToSize(text, usableWidth);
+    ensureSpace(lines.length * 12 + 4);
+    lines.forEach((line, i) => {
+      if (i === 0) {
+        // bold the label portion
+        const labelPart = label + ": ";
+        doc.setFont("helvetica", "bold");
+        doc.text(labelPart, marginX, y);
+        const labelWidth = doc.getTextWidth(labelPart);
+        doc.setFont("helvetica", "normal");
+        doc.text(line.slice(labelPart.length), marginX + labelWidth, y);
+      } else {
+        doc.text(line, marginX, y);
+      }
+      y += 12;
+    });
+    y += 2;
+  }
+
+  function fieldGridBlock(fieldDefs, valuesObj) {
+    fieldDefs.forEach((f) => {
+      if (f.type === "textarea") {
+        labelValueLine(f.label, valuesObj[f.id]);
+      } else {
+        labelValueLine(f.label, valuesObj[f.id]);
+      }
+    });
+  }
+
+  // Compact label:value renderer used by the condensed page-1 layout -
+  // smaller font, caller-supplied width/position, returns the height used
+  // so callers can lay multiple columns/rows side by side.
+  function compactLabelValue(x, yPos, maxWidth, label, value) {
+    const text = label + ": " + (value && value.toString().trim() ? value : "\u2014");
+    const labelPart = label + ": ";
+    doc.setFontSize(7.6);
+    const lines = doc.splitTextToSize(text, maxWidth);
+    lines.forEach((line, i) => {
+      const lineY = yPos + i * 9.2;
+      if (i === 0) {
+        doc.setFont("helvetica", "bold");
+        doc.text(labelPart, x, lineY);
+        const lw = doc.getTextWidth(labelPart);
+        doc.setFont("helvetica", "normal");
+        doc.text(line.slice(labelPart.length), x + lw, lineY);
+      } else {
+        doc.setFont("helvetica", "normal");
+        doc.text(line, x, lineY);
+      }
+    });
+    return lines.length * 9.2;
+  }
+
+  // Condensed two-per-row layout for short fields (used for Measure/Service
+  // Details and Installer Notes on page 1) - textarea fields always get
+  // their own full-width row since notes can run long.
+  function twoColumnFieldGrid(fieldDefs, valuesObj) {
+    const colWidth = (pageWidth - marginX * 2 - 14) / 2;
+    let i = 0;
+    while (i < fieldDefs.length) {
+      const f1 = fieldDefs[i];
+      if (f1.type === "textarea") {
+        labelValueLine(f1.label, valuesObj[f1.id]);
+        i += 1;
+        continue;
+      }
+      const f2 = (i + 1 < fieldDefs.length && fieldDefs[i + 1].type !== "textarea") ? fieldDefs[i + 1] : null;
+      ensureSpace(24);
+      const h1 = compactLabelValue(marginX, y, colWidth, f1.label, valuesObj[f1.id]);
+      const h2 = f2 ? compactLabelValue(marginX + colWidth + 14, y, colWidth, f2.label, valuesObj[f2.id]) : 0;
+      y += Math.max(h1, h2) + 3;
+      i += f2 ? 2 : 1;
+    }
+  }
+
+  // Sold To / Bill To, Project Information, and the fixed Ship To Location
+  // rendered as three side-by-side columns so all of this introductory
+  // information stays together on page 1, per Matthew's request - it never
+  // spills onto page 2 even though the line-item table that follows is
+  // often very tall.
+  function threeColumnIntro(soldToSection, projectInfoSection) {
+    const gap = 12;
+    const colWidth = (pageWidth - marginX * 2 - gap * 2) / 3;
+    const startY = y;
+    let maxH = 0;
+
+    function renderColumn(x, title, rows) {
+      let cy = startY;
+      doc.setFillColor(22, 35, 63);
+      doc.rect(x, cy, colWidth, 16, "F");
+      doc.setTextColor(255, 255, 255);
+      doc.setFont("helvetica", "bold");
+      doc.setFontSize(8);
+      doc.text(title.toUpperCase(), x + 4, cy + 11);
+      doc.setTextColor(0, 0, 0);
+      cy += 24;
+      rows.forEach(([label, value]) => {
+        const h = compactLabelValue(x + 2, cy, colWidth - 4, label, value);
+        cy += h + 2;
+      });
+      maxH = Math.max(maxH, cy - startY);
+    }
+
+    const soldToRows = soldToSection.fields.map((f) => [f.label, job.fields[f.id]]);
+    const projRows = projectInfoSection.fields.map((f) => [f.label, job.fields[f.id]]);
+    const s = MWT_CONFIG.shipTo;
+    const shipRows = [
+      ["Company Name", s.companyName],
+      ["Contact", s.contact],
+      ["Street", s.street],
+      ["City/State/Zip", s.cityStateZip],
+      ["Phone", s.phone],
+      ["Shipping Notes", s.shippingNotes]
+    ];
+
+    renderColumn(marginX, soldToSection.title, soldToRows);
+    renderColumn(marginX + colWidth + gap, projectInfoSection.title, projRows);
+    renderColumn(marginX + (colWidth + gap) * 2, "Ship To Location", shipRows);
+
+    y = startY + maxH + 12;
+  }
+
+  drawHeader();
+
+  if (schema.mainHeaderTitle) {
+    doc.setFont("helvetica", "bold");
+    doc.setFontSize(11);
+    doc.text(schema.mainHeaderTitle, marginX, y);
+    y += 14;
+    doc.setFont("helvetica", "normal");
+    doc.setFontSize(9);
+    doc.text(MWT_CONFIG.companyPhone + "  \u00b7  " + MWT_CONFIG.shipTo.companyName, marginX, y);
+    y += 14;
+  }
+
+  // Job identity
+  labelValueLine("Job Name", computeDisplayName(job));
+  labelValueLine("Created", new Date(job.createdAt).toLocaleString());
+  if (job.submittedAt) labelValueLine("Submitted", new Date(job.submittedAt).toLocaleString());
+  y += 4;
+
+  // Sections - Sold To/Bill To and Project Information (when present) are
+  // pulled out to render together with Ship To as three compact columns
+  // below; everything else (Measure/Service Details, Installer Notes, or
+  // any form-specific section like Service's Designer & End-User info)
+  // renders in reading order first, condensed where it's just short
+  // fields, so the whole introductory block fits on page 1.
+  const soldToSection = schema.sections.find((s) => s.title === "Sold To / Bill To");
+  const projectInfoSection = schema.sections.find((s) => s.title === "Project Information");
+  const otherSections = schema.sections.filter((s) => s !== soldToSection && s !== projectInfoSection);
+
+  otherSections.forEach((section) => {
+    sectionTitle(section.title);
+    if (section.title === "Installer Notes Section" || section.title === "Measure / Service Details") {
+      twoColumnFieldGrid(section.fields, job.fields);
+    } else {
+      fieldGridBlock(section.fields, job.fields);
+    }
+  });
+
+  if (soldToSection && projectInfoSection) {
+    threeColumnIntro(soldToSection, projectInfoSection);
+  } else {
+    if (soldToSection) { sectionTitle(soldToSection.title); fieldGridBlock(soldToSection.fields, job.fields); }
+    if (projectInfoSection) { sectionTitle(projectInfoSection.title); fieldGridBlock(projectInfoSection.fields, job.fields); }
+    sectionTitle("Ship To Location");
+    const s = MWT_CONFIG.shipTo;
+    labelValueLine("Company Name", s.companyName);
+    labelValueLine("Contact", s.contact);
+    labelValueLine("Street", s.street);
+    labelValueLine("City/State/Zip", s.cityStateZip);
+    labelValueLine("Phone", s.phone);
+    labelValueLine("Shipping Notes", s.shippingNotes);
+  }
+
+
+  // Service-request specific extras
+  if (schema.requestTypeField) {
+    sectionTitle("Request Type");
+    const sel = (job.fields[schema.requestTypeField.id] || "").split("|||").filter(Boolean);
+    labelValueLine(schema.requestTypeField.label, sel.length ? sel.join(", ") : "\u2014");
+  }
+  if (schema.fields) {
+    sectionTitle("Service Details");
+    schema.fields.forEach((f) => {
+      if (f.type === "checkbox-group") {
+        const sel = (job.fields[f.id] || "").split("|||").filter(Boolean);
+        labelValueLine(f.label, sel.length ? sel.join(", ") : "\u2014");
+      } else if (f.type === "yesno-count") {
+        const [yn, count] = (job.fields[f.id] || "").split("|||");
+        labelValueLine(f.label, yn ? yn + (count ? " (" + count + ")" : "") : "\u2014");
+      } else {
+        labelValueLine(f.label, job.fields[f.id]);
+      }
+    });
+  }
+
+  // Line items table
+  if (schema.lineItems && job.lineItems && job.lineItems.length) {
+    sectionTitle(schema.lineItems.title);
+    const cols = schema.lineItems.columns;
+    const head = [["#", ...cols.map((c) => c.label), ...(schema.lineItems.hasPhotoColumn ? ["Photo"] : [])]];
+    const bodyRows = job.lineItems.map((row, i) => [
+      String(i + 1),
+      ...cols.map((c) => row[c.id] || ""),
+      ...(schema.lineItems.hasPhotoColumn
+        ? [(row.photos && row.photos.length) ? row.photos.length + " photo" + (row.photos.length === 1 ? "" : "s") : "\u2014"]
+        : [])
+    ]);
+    doc.autoTable({
+      startY: y,
+      head,
+      body: bodyRows,
+      margin: { left: marginX, right: marginX },
+      styles: { fontSize: 7.5, cellPadding: 3, overflow: "linebreak" },
+      headStyles: { fillColor: [192, 57, 43], textColor: 255, fontSize: 7.5 },
+      theme: "grid",
+      didDrawPage: () => {}
+    });
+    y = doc.lastAutoTable.finalY + 16;
+  }
+
+  // Attachments (general job-level files, unrelated to specific line items)
+  if (job.attachments && job.attachments.length) {
+    sectionTitle("Photos / Files Attached to This Job (" + job.attachments.length + ")");
+    doc.setFont("helvetica", "normal");
+    doc.setFontSize(9.5);
+    job.attachments.forEach((a) => {
+      labelValueLine(a.type && a.type.startsWith("image/") ? "Photo" : "File", a.name + " (" + Math.round((a.size || 0) / 1024) + " KB)");
+    });
+
+    // Embed image thumbnails on their own page(s) so the reviewer can see them.
+    const images = job.attachments.filter((a) => a.type && a.type.startsWith("image/"));
+    if (images.length) {
+      doc.addPage(wide ? "landscape" : "portrait");
+      y = 40;
+      doc.setFont("helvetica", "bold");
+      doc.setFontSize(12);
+      doc.text("Attached Photos", marginX, y);
+      y += 16;
+      const thumbW = 160, thumbH = 120, gap = 12;
+      let x = marginX;
+      images.forEach((img) => {
+        if (x + thumbW > pageWidth - marginX) { x = marginX; y += thumbH + 24; }
+        if (y + thumbH + 24 > pageHeight - 30) { doc.addPage(wide ? "landscape" : "portrait"); y = 40; x = marginX; }
+        try {
+          doc.addImage(img.dataUrl, undefined, x, y, thumbW, thumbH, undefined, "FAST");
+        } catch (e) {
+          doc.rect(x, y, thumbW, thumbH);
+          doc.text("Could not preview", x + 8, y + thumbH / 2);
+        }
+        doc.setFontSize(7.5);
+        doc.text(img.name, x, y + thumbH + 10, { maxWidth: thumbW });
+        x += thumbW + gap;
+      });
+    }
+  }
+
+  // Motorization control devices
+  if (schema.motorizationControlDevices) {
+    sectionTitle(schema.motorizationControlDevices.title);
+    fieldGridBlock(schema.motorizationControlDevices.fields, job.motorization || {});
+  }
+
+  // Additional notes
+  sectionTitle(schema.additionalNotesLabel || "Additional Notes");
+  const notesText = job.fields.__additionalNotes && job.fields.__additionalNotes.trim() ? job.fields.__additionalNotes : "\u2014";
+  const noteLines = doc.splitTextToSize(notesText, pageWidth - marginX * 2);
+  ensureSpace(noteLines.length * 12 + 6);
+  doc.setFont("helvetica", "normal");
+  doc.setFontSize(9.5);
+  doc.text(noteLines, marginX, y);
+  y += noteLines.length * 12 + 10;
+
+  // Project Photos - per-line-item photos, clearly labeled by line/room/product
+  // so the designer immediately knows which window each photo belongs to.
+  if (schema.lineItems && schema.lineItems.hasPhotoColumn) {
+    const rowsWithPhotos = (job.lineItems || []).filter((r) => r.photos && r.photos.length);
+    if (rowsWithPhotos.length) {
+      doc.addPage(wide ? "landscape" : "portrait");
+      y = 40;
+      doc.setFont("helvetica", "bold");
+      doc.setFontSize(13);
+      doc.text("PROJECT PHOTOS", marginX, y);
+      y += 20;
+
+      const thumbW = wide ? 220 : 170;
+      const thumbH = wide ? 165 : 130;
+      const gap = 14;
+
+      job.lineItems.forEach((row, idx) => {
+        const photos = row.photos || [];
+        if (!photos.length) return;
+
+        ensureSpace(thumbH + 40);
+        doc.setFont("helvetica", "bold");
+        doc.setFontSize(11);
+        const heading = "LINE " + (idx + 1) + " \u2014 " + (row.room || "\u2014") + (row.productName ? " \u2014 " + row.productName : "");
+        doc.text(heading, marginX, y);
+        y += 16;
+
+        let x = marginX;
+        photos.forEach((p) => {
+          if (x + thumbW > pageWidth - marginX) { x = marginX; y += thumbH + 22; }
+          if (y + thumbH + 22 > pageHeight - 30) { doc.addPage(wide ? "landscape" : "portrait"); y = 40; x = marginX; }
+          try {
+            doc.addImage(p.dataUrl, undefined, x, y, thumbW, thumbH, undefined, "FAST");
+          } catch (e) {
+            doc.rect(x, y, thumbW, thumbH);
+            doc.setFontSize(8);
+            doc.text("Could not preview", x + 8, y + thumbH / 2);
+          }
+          x += thumbW + gap;
+        });
+        y += thumbH + 28;
+        x = marginX;
+      });
+    }
+  }
+
+  // Footer note + page numbers on every page
+  const pageCount = doc.internal.getNumberOfPages();
+  for (let i = 1; i <= pageCount; i++) {
+    doc.setPage(i);
+    doc.setFont("helvetica", "italic");
+    doc.setFontSize(7.5);
+    doc.setTextColor(110, 110, 110);
+    if (schema.footerNote) {
+      doc.text(doc.splitTextToSize(schema.footerNote, pageWidth - marginX * 2), marginX, pageHeight - 22);
+    }
+    doc.text("Page " + i + " of " + pageCount, pageWidth - marginX, pageHeight - 10, { align: "right" });
+    doc.setTextColor(0, 0, 0);
+  }
+
+  return doc.output("blob");
+}
