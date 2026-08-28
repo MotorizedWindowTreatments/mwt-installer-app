@@ -1268,7 +1268,8 @@ async function doSubmit(job, schema) {
     // body itself is still plain JSON text; Apps Script parses it with
     // JSON.parse(e.postData.contents) on the other end.
     const payloadBody = JSON.stringify({
-      token: MWT_CONFIG.submitToken,
+      action: "submit",
+      deviceToken: getDeviceToken(),
       subject,
       filename: fileName,
       jobName,
@@ -1369,6 +1370,123 @@ function openModal({ title, body, bodyNode, confirmLabel, confirmClass, onConfir
 }
 
 // ---------------------------------------------------------------
+// Device authorization (shared PIN gate)
+// ---------------------------------------------------------------
+
+function getDeviceToken() {
+  try {
+    return localStorage.getItem(MWT_CONFIG.deviceTokenStorageKey) || "";
+  } catch (e) {
+    return ""; // private-browsing / storage disabled - falls through to asking for the PIN every time
+  }
+}
+
+function setDeviceToken(token) {
+  try {
+    localStorage.setItem(MWT_CONFIG.deviceTokenStorageKey, token);
+  } catch (e) {
+    // Storage unavailable (e.g. some private-browsing modes) - the PIN
+    // will simply be asked for again next time the app opens in that
+    // case, which is a safe fallback rather than a broken state.
+  }
+}
+
+function renderAuthScreen() {
+  document.getElementById("sidebar").style.display = "none";
+  document.getElementById("topbar").style.display = "none";
+  const content = document.getElementById("content");
+  content.innerHTML = "";
+
+  const wrap = el("div", { class: "auth-gate" });
+  const card = el("div", { class: "auth-card" });
+
+  card.appendChild(el("div", { class: "auth-logo" }, ["MWT ", el("span", {}, "INSTALLER")]));
+  card.appendChild(el("h2", {}, "Device Authorization"));
+  card.appendChild(el("div", { class: "help-text", style: "margin-bottom:16px;" }, "Enter Access Code"));
+
+  const pinInput = el("input", {
+    type: "tel",
+    inputmode: "numeric",
+    pattern: "[0-9]*",
+    maxlength: "4",
+    autocomplete: "off",
+    class: "auth-pin-input",
+    placeholder: "\u2022\u2022\u2022\u2022"
+  });
+  pinInput.addEventListener("input", () => {
+    pinInput.value = pinInput.value.replace(/[^0-9]/g, "").slice(0, 4);
+    errorBox.textContent = "";
+  });
+  card.appendChild(pinInput);
+
+  const errorBox = el("div", { class: "auth-error" }, "");
+  card.appendChild(errorBox);
+
+  const authorizeBtn = el("button", { class: "btn btn-primary auth-btn" }, "Authorize iPad");
+  card.appendChild(authorizeBtn);
+
+  function setBusy(busy) {
+    authorizeBtn.disabled = busy;
+    pinInput.disabled = busy;
+    authorizeBtn.textContent = busy ? "Checking\u2026" : "Authorize iPad";
+  }
+
+  async function attemptAuthorize() {
+    const pin = pinInput.value.trim();
+    if (pin.length !== 4) {
+      errorBox.textContent = "Enter the 4-digit access code.";
+      return;
+    }
+    if (!navigator.onLine) {
+      errorBox.textContent = "No internet connection. Connect this iPad to the internet once to authorize it.";
+      return;
+    }
+    setBusy(true);
+    errorBox.textContent = "";
+    try {
+      const resp = await fetch(MWT_CONFIG.submitApiUrl, {
+        method: "POST",
+        headers: { "Content-Type": "text/plain;charset=utf-8" },
+        body: JSON.stringify({ action: "authorize", pin })
+      });
+      let payload = null;
+      try { payload = await resp.json(); } catch (parseErr) { /* handled below */ }
+
+      if (resp.ok && payload && payload.success && payload.token) {
+        setDeviceToken(payload.token);
+        content.innerHTML = "";
+        content.appendChild(el("div", { class: "auth-gate" }, el("div", { class: "auth-card" }, [
+          el("div", { class: "auth-logo" }, ["MWT ", el("span", {}, "INSTALLER")]),
+          el("h2", {}, "This iPad has been authorized."),
+          el("div", { class: "help-text" }, "Opening the dashboard\u2026")
+        ])));
+        setTimeout(async () => {
+          document.getElementById("sidebar").style.display = "";
+          document.getElementById("topbar").style.display = "";
+          await refreshJobsCache();
+          render();
+        }, 900);
+      } else {
+        errorBox.textContent = (payload && payload.error) ? payload.error : "Incorrect access code.";
+        pinInput.value = "";
+        pinInput.focus();
+      }
+    } catch (err) {
+      errorBox.textContent = "Could not reach the server. Check your connection and try again.";
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  authorizeBtn.addEventListener("click", attemptAuthorize);
+  pinInput.addEventListener("keydown", (e) => { if (e.key === "Enter") attemptAuthorize(); });
+
+  wrap.appendChild(card);
+  content.appendChild(wrap);
+  pinInput.focus();
+}
+
+// ---------------------------------------------------------------
 // Init
 // ---------------------------------------------------------------
 
@@ -1386,6 +1504,13 @@ document.addEventListener("DOMContentLoaded", async () => {
     document.getElementById("sidebar").classList.toggle("open");
   });
   updateOfflineBanner();
-  await refreshJobsCache();
-  render();
+
+  if (getDeviceToken()) {
+    // Already authorized on this iPad - go straight to the dashboard,
+    // no network call needed (keeps app opening fully offline-capable).
+    await refreshJobsCache();
+    render();
+  } else {
+    renderAuthScreen();
+  }
 });
