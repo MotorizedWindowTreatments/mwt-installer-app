@@ -742,11 +742,33 @@ button, input, select, textarea {
     z-index: 40;
     width: 82vw;
     max-width: 320px;
+
+    /* Keep sidebar content below the iPhone/iPad status bar */
+    padding-top: env(safe-area-inset-top, 0px);
   }
-  #sidebar.open { transform: translateX(0); box-shadow: 0 0 30px rgba(0,0,0,0.3); }
-  #topbar .menu-btn { display: inline-block; }
+
+  #sidebar.open {
+    transform: translateX(0);
+    box-shadow: 0 0 30px rgba(0,0,0,0.3);
+  }
+
+  #topbar {
+    /* Prevent menu/title from sitting underneath the iPhone status bar */
+    padding-top: calc(10px + env(safe-area-inset-top, 0px));
+    min-height: calc(56px + env(safe-area-inset-top, 0px));
+  }
+
+  #topbar .menu-btn {
+    display: inline-block;
+    flex-shrink: 0;
+  }
+
   #content { padding: 14px; }
-  .action-bar { margin: 18px -14px -14px; padding: 12px 14px; }
+
+  .action-bar {
+    margin: 18px -14px -14px;
+    padding: 12px 14px;
+  }
 }
 
 @media (max-width: 480px) {
