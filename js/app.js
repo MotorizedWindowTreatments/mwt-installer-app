@@ -108,6 +108,25 @@ function computeDisplayName(job) {
   return name || "Untitled Job";
 }
 
+// Email subject ONLY - always "Design Firm - Sidemark" built straight
+// from the entered field values, e.g. "MWT \u2013 Kandl". Deliberately
+// ignores job.manualName and never appends the form name, per Matthew's
+// correction - ONLY used for the Submit & Send email subject, not for
+// Saved Jobs, the sidebar, or the PDF's own "Job Name" line (those all
+// still use computeDisplayName() above, unchanged).
+function buildEmailSubject(job) {
+  const f = job.fields || {};
+  const firm = (f.designFirm || "").trim();
+  const sidemark = (f.sidemark || "").trim();
+  if (firm && sidemark) return firm + " \u2013 " + sidemark;
+  if (firm) return firm;
+  if (sidemark) return sidemark;
+  // Fallback for forms with no Design Firm / Sidemark fields (e.g.
+  // Service / Retrofit / Cut-Down) - keeps the email subject meaningful
+  // rather than blank.
+  return computeDisplayName(job);
+}
+
 async function refreshJobsCache() {
   state.jobsCache = await MwtDB.getAllJobs();
   state.jobsCache.sort((a, b) => (b.lastModified || "").localeCompare(a.lastModified || ""));
@@ -1231,8 +1250,12 @@ async function doSubmit(job, schema) {
   const fileName = pdfFileName(job, schema);
   const jobName = computeDisplayName(job);
   const formType = schema.label || schema.pdfTitle;
-  // "Design Firm - Sidemark - Form Name", e.g. "MWT \u2013 Kandl \u2013 Blinds & Shades Order".
-  const subject = jobName + " \u2013 " + formType;
+  // Email subject is ONLY "Design Firm - Sidemark" (e.g. "MWT \u2013 Kandl"),
+  // built directly from the entered field values - NOT the manually
+  // entered Job Name, and with no form name appended. (The PDF's own
+  // "Job Name" line still uses computeDisplayName() as before - this
+  // only affects the email subject.)
+  const subject = buildEmailSubject(job);
 
   try {
     const base64Pdf = await blobToBase64(blob);
