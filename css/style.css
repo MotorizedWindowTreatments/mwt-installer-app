@@ -649,6 +649,68 @@ button, input, select, textarea {
 .toast.error { background: var(--mwt-red-dark); }
 .toast.success { background: var(--mwt-green); }
 
+/* ---------------- Device authorization (PIN gate) ---------------- */
+
+.auth-gate {
+  min-height: 70vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+}
+
+.auth-card {
+  background: #fff;
+  border: 1px solid var(--mwt-border);
+  border-radius: 14px;
+  padding: 32px 28px;
+  width: 100%;
+  max-width: 360px;
+  text-align: center;
+  box-shadow: 0 10px 30px rgba(0,0,0,0.08);
+}
+
+.auth-card .auth-logo {
+  font-weight: 800;
+  font-size: 20px;
+  letter-spacing: 0.5px;
+  color: var(--mwt-navy);
+  margin-bottom: 18px;
+}
+.auth-card .auth-logo span { color: var(--mwt-red); }
+
+.auth-card h2 {
+  margin: 0 0 4px;
+  font-size: 18px;
+}
+
+.auth-pin-input {
+  width: 100%;
+  font-size: 30px;
+  letter-spacing: 14px;
+  text-align: center;
+  padding: 14px 10px;
+  border: 1px solid var(--mwt-border);
+  border-radius: var(--radius);
+  min-height: 56px;
+  margin-bottom: 10px;
+}
+.auth-pin-input:focus {
+  outline: 2px solid var(--mwt-red);
+  outline-offset: 1px;
+}
+
+.auth-error {
+  min-height: 18px;
+  color: var(--mwt-red-dark);
+  font-size: 13.5px;
+  margin-bottom: 12px;
+}
+
+.auth-btn {
+  width: 100%;
+}
+
 /* ---------------- Empty state ---------------- */
 
 .empty-state {
