@@ -288,7 +288,13 @@ function buildJobPdfBlob(job, schema) {
     y = doc.lastAutoTable.finalY + 16;
   }
 
-  // Attachments (general job-level files, unrelated to specific line items)
+  // Attachments (general job-level files, unrelated to specific line
+  // items) - text listing only. The actual photo/image is intentionally
+  // NOT rendered here: any image among these general attachments (and
+  // every per-line-item photo) already appears, once, in the dedicated
+  // PROJECT PHOTOS section further down. Rendering an image here too
+  // used to duplicate it and also left a stray page/cursor position that
+  // Motorization Control Devices would then get drawn on top of.
   if (job.attachments && job.attachments.length) {
     sectionTitle("Photos / Files Attached to This Job (" + job.attachments.length + ")");
     doc.setFont("helvetica", "normal");
@@ -296,32 +302,6 @@ function buildJobPdfBlob(job, schema) {
     job.attachments.forEach((a) => {
       labelValueLine(a.type && a.type.startsWith("image/") ? "Photo" : "File", a.name + " (" + Math.round((a.size || 0) / 1024) + " KB)");
     });
-
-    // Embed image thumbnails on their own page(s) so the reviewer can see them.
-    const images = job.attachments.filter((a) => a.type && a.type.startsWith("image/"));
-    if (images.length) {
-      doc.addPage(wide ? "landscape" : "portrait");
-      y = 40;
-      doc.setFont("helvetica", "bold");
-      doc.setFontSize(12);
-      doc.text("Attached Photos", marginX, y);
-      y += 16;
-      const thumbW = 160, thumbH = 120, gap = 12;
-      let x = marginX;
-      images.forEach((img) => {
-        if (x + thumbW > pageWidth - marginX) { x = marginX; y += thumbH + 24; }
-        if (y + thumbH + 24 > pageHeight - 30) { doc.addPage(wide ? "landscape" : "portrait"); y = 40; x = marginX; }
-        try {
-          doc.addImage(img.dataUrl, undefined, x, y, thumbW, thumbH, undefined, "FAST");
-        } catch (e) {
-          doc.rect(x, y, thumbW, thumbH);
-          doc.text("Could not preview", x + 8, y + thumbH / 2);
-        }
-        doc.setFontSize(7.5);
-        doc.text(img.name, x, y + thumbH + 10, { maxWidth: thumbW });
-        x += thumbW + gap;
-      });
-    }
   }
 
   // Motorization control devices
