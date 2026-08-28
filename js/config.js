@@ -19,18 +19,19 @@ const MWT_CONFIG = {
   //   https://script.google.com/macros/s/AKfycb.../exec
   submitApiUrl: "https://script.google.com/macros/s/AKfycbxVhAo4XBokM5kkd7LurgDMBdQbbxKWfrYwfiu8t7mNDT4sNRSKeB7O9gIXxMfeZMDu_A/exec",
 
-  // A simple shared value the backend checks before sending anything.
-  // This is NOT a real secret (anything in this file is visible to
-  // anyone who views the page source) - its only purpose is to stop a
-  // stranger who stumbles on the backend URL from spamming Matthew and
-  // Katie's inboxes through it. It must match the SHARED_TOKEN constant
-  // at the top of Code.gs exactly.
-  submitToken: "mwt-installer-2026",
+  // Where this iPad's device authorization token is remembered once
+  // it's been unlocked with the shared PIN - see app.js. Nothing about
+  // the PIN itself, or which devices are authorized, is ever stored in
+  // this file; the correct PIN lives only in Code.gs's Script
+  // Properties, and the list of authorized device tokens lives only on
+  // the Apps Script server. This is just the localStorage key name used
+  // to remember THIS device's own token once it's been issued.
+  deviceTokenStorageKey: "mwt_device_token",
 
   // The Designer's email is collected on each job (Sold To / Bill To
   // section) but is NOT part of the Submit & Send email recipients -
   // per Matthew's instruction, that email goes only to the two fixed
-  // addresses hard-coded server-side in mwt-submit-backend/Code.gs.
+  // addresses hard-coded server-side in mwt-submit-backend-gas/Code.gs.
 
   // MWT's fixed shipping/receiving info, printed on every form
   // (matches the current MWT paper/website forms).
@@ -53,5 +54,5 @@ const MWT_CONFIG = {
   // warn the installer that offline storage may be getting tight.
   attachmentWarningBytes: 15 * 1024 * 1024, // 15 MB per job
 
-  appVersion: "1.2"
+  appVersion: "1.3"
 };
