@@ -73,6 +73,12 @@ function blankJob(formType) {
     submittedAt: null,
     revision: 0,
     projectNumber: "",
+    // A stable identifier for this job's eventual submission, generated
+    // once and reused across retries so the backend can tell "the same
+    // submit, retried" apart from "a genuinely new submission" - this is
+    // what prevents a duplicate email/archive if a response is lost and
+    // the installer taps Submit & Send again.
+    submissionId: uid(),
     fields: {},
     lineItems: [],
     motorization: {},
@@ -276,6 +282,7 @@ function renderSidebar() {
   nav.prepend(dashBtn);
   nav.appendChild(savedGroup);
   nav.appendChild(renderBackupGroup());
+  nav.appendChild(renderAccountGroup());
 
   renderSidebarJobList();
 }
@@ -306,6 +313,35 @@ function renderBackupGroup() {
   );
   group.appendChild(importInput);
   return group;
+}
+
+function renderAccountGroup() {
+  const group = el("div", { class: "nav-group" }, [el("h4", {}, "Account")]);
+  group.appendChild(
+    el("button", {
+      class: "nav-item",
+      onclick: () => {
+        openModal({
+          title: "Log out of Installer Mode?",
+          body: "This removes this iPad's Installer authorization. You'll need the 4-digit access code again to create or submit jobs on this device. Saved jobs already on this iPad are not affected.",
+          confirmLabel: "Log Out",
+          confirmClass: "btn-danger",
+          onConfirm: logOutInstaller
+        });
+      }
+    }, "\u23FB Log Out")
+  );
+  return group;
+}
+
+function logOutInstaller() {
+  clearDeviceToken();
+  location.reload();
+}
+
+function logOutAdmin() {
+  clearAdminToken();
+  location.reload();
 }
 
 async function exportBackup() {
@@ -529,6 +565,10 @@ async function duplicateJob(id) {
   copy.lastModified = nowStamp();
   copy.submittedAt = null;
   copy.revision = 0;
+  // A duplicate is a distinct future submission, not a retry of the
+  // original - it must get its own submissionId so it can never be
+  // treated as "already processed" by the backend's idempotency check.
+  copy.submissionId = uid();
   copy.manualName = (orig.manualName || computeDisplayName(orig)) + " (copy)";
   await MwtDB.saveJob(copy);
   await refreshJobsCache();
@@ -1219,6 +1259,17 @@ async function previewPdf(job, schema) {
   }
 }
 
+// Reads the Designer's email from whichever field holds it on this
+// form (Blinds & Shades / Drapery use "email" in Sold To / Bill To;
+// Service / Retrofit / Cut-Down uses its own "designerEmail" field).
+function getDesignerEmail(job) {
+  return (job.fields.email || job.fields.designerEmail || "").trim();
+}
+
+function isValidEmailFormat(addr) {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(addr);
+}
+
 function confirmSubmit(job, schema) {
   collectFormData();
   const missing = validateRequired(job, schema);
@@ -1226,6 +1277,28 @@ function confirmSubmit(job, schema) {
     toast("Please fill in required fields first: " + missing.join(", "), "error");
     return;
   }
+
+  const designerEmail = getDesignerEmail(job);
+
+  if (designerEmail && !isValidEmailFormat(designerEmail)) {
+    // Do NOT submit, and do not even open a confirmation - the installer
+    // must fix or clear the field first.
+    toast("Please correct or remove the Designer Email before submitting.", "error");
+    return;
+  }
+
+  if (!designerEmail) {
+    openModal({
+      title: "Designer email is missing.",
+      body: "Are you sure you want to submit this job without sending a copy to the designer?",
+      confirmLabel: "Submit Without Designer Email",
+      confirmClass: "btn-primary",
+      cancelLabel: "Go Back",
+      onConfirm: () => doSubmit(job, schema)
+    });
+    return;
+  }
+
   openModal({
     title: "Submit this project?",
     body: "You're about to finalize \u201c" + computeDisplayName(job) + "\u201d, generate the PDF, and send it to Matthew, Katie, MWT Measures, and the Designer on this job. You can still reopen and correct it after submitting if needed.",
@@ -1256,6 +1329,11 @@ async function doSubmit(job, schema) {
   // "Job Name" line still uses computeDisplayName() as before - this
   // only affects the email subject.)
   const subject = buildEmailSubject(job);
+  const designerEmail = getDesignerEmail(job);
+
+  // Backward-compat: a job saved before this update won't have a
+  // submissionId yet - generate one now rather than block submission.
+  if (!job.submissionId) job.submissionId = uid();
 
   try {
     const base64Pdf = await blobToBase64(blob);
@@ -1267,13 +1345,23 @@ async function doSubmit(job, schema) {
     // trigger, which silently breaks the request in the browser. The
     // body itself is still plain JSON text; Apps Script parses it with
     // JSON.parse(e.postData.contents) on the other end.
+    //
+    // Note: only the (optional, validated) designerEmail is sent - the
+    // app never sends a recipient list. The three fixed company
+    // addresses are hard-coded server-side and cannot be changed or
+    // seen from here.
     const payloadBody = JSON.stringify({
       action: "submit",
-      deviceToken: getDeviceToken(),
+      installerToken: getDeviceToken(),
+      submissionId: job.submissionId,
       subject,
       filename: fileName,
       jobName,
       formType,
+      designFirm: job.fields.designFirm || "",
+      sidemark: job.fields.sidemark || "",
+      projectNumber: job.projectNumber || "",
+      designerEmail,
       pdfBase64: base64Pdf
     });
 
@@ -1345,7 +1433,7 @@ function blobToBase64(blob) {
 // Modal
 // ---------------------------------------------------------------
 
-function openModal({ title, body, bodyNode, confirmLabel, confirmClass, onConfirm, hideCancel, wide }) {
+function openModal({ title, body, bodyNode, confirmLabel, confirmClass, onConfirm, hideCancel, cancelLabel, wide }) {
   const overlay = el("div", { class: "modal-overlay", onclick: (e) => { if (e.target === overlay) close(); } });
   const modal = el("div", { class: "modal", style: wide ? "max-width:900px;" : "" });
   modal.appendChild(el("h3", {}, title));
@@ -1354,7 +1442,7 @@ function openModal({ title, body, bodyNode, confirmLabel, confirmClass, onConfir
 
   const btnRow = el("div", { class: "btn-row" });
   if (!hideCancel) {
-    btnRow.appendChild(el("button", { class: "btn btn-outline", onclick: close }, "Cancel"));
+    btnRow.appendChild(el("button", { class: "btn btn-outline", onclick: close }, cancelLabel || "Cancel"));
   }
   btnRow.appendChild(
     el("button", {
@@ -1370,7 +1458,11 @@ function openModal({ title, body, bodyNode, confirmLabel, confirmClass, onConfir
 }
 
 // ---------------------------------------------------------------
-// Device authorization (shared PIN gate)
+// Authorization: Installer (PIN) and Administrator (password) are two
+// separate roles with separate tokens, separate localStorage keys, and
+// separate server-side permissions - an Installer token can never be
+// used for Admin actions and vice versa (enforced in Code.gs, not just
+// hidden in this UI).
 // ---------------------------------------------------------------
 
 function getDeviceToken() {
@@ -1391,7 +1483,59 @@ function setDeviceToken(token) {
   }
 }
 
-function renderAuthScreen() {
+function clearDeviceToken() {
+  try { localStorage.removeItem(MWT_CONFIG.deviceTokenStorageKey); } catch (e) { /* ignore */ }
+}
+
+function getAdminToken() {
+  try {
+    return localStorage.getItem(MWT_CONFIG.adminTokenStorageKey) || "";
+  } catch (e) {
+    return "";
+  }
+}
+
+function setAdminToken(token) {
+  try {
+    localStorage.setItem(MWT_CONFIG.adminTokenStorageKey, token);
+  } catch (e) { /* ignore */ }
+}
+
+function clearAdminToken() {
+  try { localStorage.removeItem(MWT_CONFIG.adminTokenStorageKey); } catch (e) { /* ignore */ }
+}
+
+function renderAccessTypeScreen() {
+  document.getElementById("sidebar").style.display = "none";
+  document.getElementById("topbar").style.display = "none";
+  const content = document.getElementById("content");
+  content.innerHTML = "";
+
+  const wrap = el("div", { class: "auth-gate" });
+  const card = el("div", { class: "auth-card access-type-card" });
+
+  card.appendChild(el("div", { class: "auth-logo" }, ["MWT ", el("span", {}, "INSTALLER")]));
+  card.appendChild(el("h2", {}, "Select Access Type"));
+
+  card.appendChild(
+    el("button", { class: "access-type-btn", onclick: () => renderAuthScreen("installer") }, [
+      el("div", { class: "access-type-title" }, "Installer"),
+      el("div", { class: "access-type-desc" }, "Create, edit and submit jobs")
+    ])
+  );
+  card.appendChild(
+    el("button", { class: "access-type-btn", onclick: () => renderAuthScreen("admin") }, [
+      el("div", { class: "access-type-title" }, "Administrator"),
+      el("div", { class: "access-type-desc" }, "View submitted jobs and archived PDFs")
+    ])
+  );
+
+  wrap.appendChild(card);
+  content.appendChild(wrap);
+}
+
+function renderAuthScreen(role) {
+  const isAdmin = role === "admin";
   document.getElementById("sidebar").style.display = "none";
   document.getElementById("topbar").style.display = "none";
   const content = document.getElementById("content");
@@ -1401,75 +1545,88 @@ function renderAuthScreen() {
   const card = el("div", { class: "auth-card" });
 
   card.appendChild(el("div", { class: "auth-logo" }, ["MWT ", el("span", {}, "INSTALLER")]));
-  card.appendChild(el("h2", {}, "Device Authorization"));
-  card.appendChild(el("div", { class: "help-text", style: "margin-bottom:16px;" }, "Enter Access Code"));
+  card.appendChild(el("h2", {}, isAdmin ? "Administrator Login" : "Device Authorization"));
+  card.appendChild(el("div", { class: "help-text", style: "margin-bottom:16px;" }, isAdmin ? "Enter Admin Password" : "Enter Access Code"));
 
-  const pinInput = el("input", {
-    type: "tel",
-    inputmode: "numeric",
-    pattern: "[0-9]*",
-    maxlength: "4",
-    autocomplete: "off",
-    class: "auth-pin-input",
-    placeholder: "\u2022\u2022\u2022\u2022"
-  });
-  pinInput.addEventListener("input", () => {
-    pinInput.value = pinInput.value.replace(/[^0-9]/g, "").slice(0, 4);
+  const input = isAdmin
+    ? el("input", { type: "password", autocomplete: "off", class: "auth-pin-input auth-password-input", placeholder: "Password" })
+    : el("input", {
+        type: "tel", inputmode: "numeric", pattern: "[0-9]*", maxlength: "4", autocomplete: "off",
+        class: "auth-pin-input", placeholder: "\u2022\u2022\u2022\u2022"
+      });
+
+  input.addEventListener("input", () => {
+    if (!isAdmin) input.value = input.value.replace(/[^0-9]/g, "").slice(0, 4);
     errorBox.textContent = "";
   });
-  card.appendChild(pinInput);
+  card.appendChild(input);
 
   const errorBox = el("div", { class: "auth-error" }, "");
   card.appendChild(errorBox);
 
-  const authorizeBtn = el("button", { class: "btn btn-primary auth-btn" }, "Authorize iPad");
+  const authorizeBtn = el("button", { class: "btn btn-primary auth-btn" }, isAdmin ? "Authorize Administrator" : "Authorize iPad");
   card.appendChild(authorizeBtn);
+  card.appendChild(el("button", { class: "btn btn-ghost auth-back-btn", onclick: () => renderAccessTypeScreen() }, "\u2190 Back"));
 
   function setBusy(busy) {
     authorizeBtn.disabled = busy;
-    pinInput.disabled = busy;
-    authorizeBtn.textContent = busy ? "Checking\u2026" : "Authorize iPad";
+    input.disabled = busy;
+    authorizeBtn.textContent = busy ? "Checking\u2026" : (isAdmin ? "Authorize Administrator" : "Authorize iPad");
   }
 
   async function attemptAuthorize() {
-    const pin = pinInput.value.trim();
-    if (pin.length !== 4) {
+    const value = input.value.trim();
+    if (!isAdmin && value.length !== 4) {
       errorBox.textContent = "Enter the 4-digit access code.";
       return;
     }
+    if (isAdmin && !value) {
+      errorBox.textContent = "Enter the administrator password.";
+      return;
+    }
     if (!navigator.onLine) {
-      errorBox.textContent = "No internet connection. Connect this iPad to the internet once to authorize it.";
+      errorBox.textContent = "No internet connection. Connect this device to the internet once to authorize it.";
       return;
     }
     setBusy(true);
     errorBox.textContent = "";
     try {
+      const bodyObj = isAdmin
+        ? { action: "authorizeAdmin", password: value }
+        : { action: "authorizeInstaller", pin: value };
       const resp = await fetch(MWT_CONFIG.submitApiUrl, {
         method: "POST",
         headers: { "Content-Type": "text/plain;charset=utf-8" },
-        body: JSON.stringify({ action: "authorize", pin })
+        body: JSON.stringify(bodyObj)
       });
       let payload = null;
       try { payload = await resp.json(); } catch (parseErr) { /* handled below */ }
 
       if (resp.ok && payload && payload.success && payload.token) {
-        setDeviceToken(payload.token);
+        if (isAdmin) setAdminToken(payload.token);
+        else setDeviceToken(payload.token);
+
         content.innerHTML = "";
         content.appendChild(el("div", { class: "auth-gate" }, el("div", { class: "auth-card" }, [
           el("div", { class: "auth-logo" }, ["MWT ", el("span", {}, "INSTALLER")]),
-          el("h2", {}, "This iPad has been authorized."),
+          el("h2", {}, isAdmin ? "This device has been authorized as Administrator." : "This iPad has been authorized."),
           el("div", { class: "help-text" }, "Opening the dashboard\u2026")
         ])));
         setTimeout(async () => {
-          document.getElementById("sidebar").style.display = "";
-          document.getElementById("topbar").style.display = "";
-          await refreshJobsCache();
-          render();
+          if (isAdmin) {
+            renderAdminDashboard();
+          } else {
+            document.getElementById("sidebar").style.display = "";
+            document.getElementById("topbar").style.display = "";
+            await refreshJobsCache();
+            await cleanupOldSubmittedJobs();
+            render();
+          }
         }, 900);
       } else {
-        errorBox.textContent = (payload && payload.error) ? payload.error : "Incorrect access code.";
-        pinInput.value = "";
-        pinInput.focus();
+        errorBox.textContent = (payload && payload.error) ? payload.error : ("Incorrect " + (isAdmin ? "password" : "access code") + ".");
+        input.value = "";
+        input.focus();
       }
     } catch (err) {
       errorBox.textContent = "Could not reach the server. Check your connection and try again.";
@@ -1479,11 +1636,235 @@ function renderAuthScreen() {
   }
 
   authorizeBtn.addEventListener("click", attemptAuthorize);
-  pinInput.addEventListener("keydown", (e) => { if (e.key === "Enter") attemptAuthorize(); });
+  input.addEventListener("keydown", (e) => { if (e.key === "Enter") attemptAuthorize(); });
 
   wrap.appendChild(card);
   content.appendChild(wrap);
-  pinInput.focus();
+  input.focus();
+}
+
+// ---------------------------------------------------------------
+// Local retention: submitted jobs are kept locally for convenience for
+// a limited time, then their local copy (and photos) are removed - the
+// central Drive/Sheet archive is untouched and Admins keep seeing them
+// there. Drafts and "ready" (offline-pending) jobs are NEVER
+// auto-deleted, no matter how old.
+// ---------------------------------------------------------------
+async function cleanupOldSubmittedJobs() {
+  try {
+    const jobs = await MwtDB.getAllJobs();
+    const cutoffMs = (MWT_CONFIG.submittedJobRetentionDays || 60) * 24 * 60 * 60 * 1000;
+    const now = Date.now();
+    for (const job of jobs) {
+      if (job.status !== "submitted" || !job.submittedAt) continue;
+      const age = now - new Date(job.submittedAt).getTime();
+      if (age > cutoffMs) {
+        await MwtDB.deleteJob(job.id);
+      }
+    }
+  } catch (err) {
+    console.warn("Local retention cleanup skipped:", err);
+  }
+}
+
+// ---------------------------------------------------------------
+// Administrator Dashboard - "Submitted Jobs"
+// Only ever loads paginated metadata from the backend; the actual PDF
+// for a row is fetched only when that row's "View PDF" is tapped.
+// Installer drafts/local jobs are never shown here and never queried -
+// this view talks only to the central archive via the Admin token.
+// ---------------------------------------------------------------
+
+const adminState = {
+  page: 1,
+  pageSize: 25,
+  designFirm: "",
+  sidemark: "",
+  projectNumber: "",
+  formType: "",
+  rows: [],
+  total: 0,
+  loading: false,
+  error: ""
+};
+
+async function renderAdminDashboard() {
+  document.getElementById("sidebar").style.display = "none";
+  document.getElementById("topbar").style.display = "none";
+  const content = document.getElementById("content");
+  content.innerHTML = "";
+
+  const wrap = el("div", { class: "admin-wrap" });
+
+  const header = el("div", { class: "admin-header" }, [
+    el("div", { class: "admin-title" }, "Submitted Jobs"),
+    el("button", {
+      class: "btn btn-outline",
+      onclick: () => {
+        openModal({
+          title: "Log out of Administrator Mode?",
+          body: "This removes this device's Administrator authorization. You'll need the admin password again to view Submitted Jobs.",
+          confirmLabel: "Log Out",
+          confirmClass: "btn-danger",
+          onConfirm: logOutAdmin
+        });
+      }
+    }, "\u23FB Log Out")
+  ]);
+  wrap.appendChild(header);
+
+  const filterBar = el("div", { class: "admin-filter-bar" });
+  const dfInput = el("input", { type: "text", placeholder: "Design Firm", value: adminState.designFirm });
+  const sideInput = el("input", { type: "text", placeholder: "Sidemark", value: adminState.sidemark });
+  const projInput = el("input", { type: "text", placeholder: "MWT Project #", value: adminState.projectNumber });
+  const formSelect = el("select", {}, [
+    el("option", { value: "" }, "All form types"),
+    ...MWT_FORM_SCHEMAS.map((s) => el("option", { value: s.label, selected: adminState.formType === s.label ? "selected" : null }, s.label))
+  ]);
+  const searchBtn = el("button", { class: "btn btn-navy" }, "Search");
+  [dfInput, sideInput, projInput].forEach((inp) => {
+    inp.addEventListener("keydown", (e) => { if (e.key === "Enter") doSearch(); });
+  });
+  function doSearch() {
+    adminState.designFirm = dfInput.value.trim();
+    adminState.sidemark = sideInput.value.trim();
+    adminState.projectNumber = projInput.value.trim();
+    adminState.formType = formSelect.value;
+    adminState.page = 1;
+    loadAndRenderResults();
+  }
+  searchBtn.addEventListener("click", doSearch);
+  formSelect.addEventListener("change", doSearch);
+
+  filterBar.appendChild(dfInput);
+  filterBar.appendChild(sideInput);
+  filterBar.appendChild(projInput);
+  filterBar.appendChild(formSelect);
+  filterBar.appendChild(searchBtn);
+  wrap.appendChild(filterBar);
+
+  const resultsBox = el("div", { class: "admin-results" });
+  wrap.appendChild(resultsBox);
+
+  content.appendChild(wrap);
+
+  async function loadAndRenderResults() {
+    resultsBox.innerHTML = "";
+    if (!navigator.onLine) {
+      resultsBox.appendChild(el("div", { class: "needs-review-banner" }, "No internet connection. Submitted Jobs requires an internet connection to load - please reconnect and search again."));
+      return;
+    }
+    resultsBox.appendChild(el("div", { class: "help-text" }, "Loading\u2026"));
+
+    try {
+      const resp = await fetch(MWT_CONFIG.submitApiUrl, {
+        method: "POST",
+        headers: { "Content-Type": "text/plain;charset=utf-8" },
+        body: JSON.stringify({
+          action: "listSubmissions",
+          adminToken: getAdminToken(),
+          page: adminState.page,
+          pageSize: adminState.pageSize,
+          designFirm: adminState.designFirm,
+          sidemark: adminState.sidemark,
+          projectNumber: adminState.projectNumber,
+          formType: adminState.formType
+        })
+      });
+      let payload = null;
+      try { payload = await resp.json(); } catch (e) { /* handled below */ }
+
+      resultsBox.innerHTML = "";
+      if (!resp.ok || !payload || !payload.success) {
+        resultsBox.appendChild(el("div", { class: "needs-review-banner" }, (payload && payload.error) ? payload.error : "Could not load submitted jobs."));
+        return;
+      }
+
+      adminState.rows = payload.rows || [];
+      adminState.total = payload.total || 0;
+      renderResultsTable(resultsBox);
+    } catch (err) {
+      resultsBox.innerHTML = "";
+      resultsBox.appendChild(el("div", { class: "needs-review-banner" }, "Could not reach the server. Check your connection and try again."));
+    }
+  }
+
+  function renderResultsTable(box) {
+    box.innerHTML = "";
+    if (!adminState.rows.length) {
+      box.appendChild(el("div", { class: "empty-state" }, [
+        el("div", { class: "big" }, "\uD83D\uDCC1"),
+        el("div", {}, "No submitted jobs match this search.")
+      ]));
+      return;
+    }
+
+    const table = el("table", { class: "job-table" });
+    table.appendChild(el("thead", {}, el("tr", {}, [
+      el("th", {}, "Submitted"), el("th", {}, "Design Firm"), el("th", {}, "Sidemark"),
+      el("th", {}, "Project #"), el("th", {}, "Form Type"), el("th", {}, "Designer Email"), el("th", {}, "")
+    ])));
+    const tbody = el("tbody", {});
+    adminState.rows.forEach((r) => {
+      tbody.appendChild(el("tr", {}, [
+        el("td", {}, fmtTime(r.timestamp)),
+        el("td", {}, r.designFirm || "\u2014"),
+        el("td", {}, r.sidemark || "\u2014"),
+        el("td", {}, r.projectNumber || "\u2014"),
+        el("td", {}, r.formType || "\u2014"),
+        el("td", {}, r.designerEmail || "\u2014"),
+        el("td", {}, el("button", { class: "btn btn-ghost", onclick: () => viewSubmittedPdf(r) }, "View PDF"))
+      ]));
+    });
+    table.appendChild(tbody);
+    box.appendChild(el("div", { class: "card", style: "overflow-x:auto;" }, table));
+
+    const totalPages = Math.max(1, Math.ceil(adminState.total / adminState.pageSize));
+    const pager = el("div", { class: "btn-row", style: "margin-top:12px;" }, [
+      el("button", { class: "btn btn-outline", disabled: adminState.page <= 1 ? "disabled" : null, onclick: () => { adminState.page--; loadAndRenderResults(); } }, "\u2190 Prev"),
+      el("div", { class: "help-text", style: "align-self:center;" }, "Page " + adminState.page + " of " + totalPages + " (" + adminState.total + " total)"),
+      el("button", { class: "btn btn-outline", disabled: adminState.page >= totalPages ? "disabled" : null, onclick: () => { adminState.page++; loadAndRenderResults(); } }, "Next \u2192")
+    ]);
+    box.appendChild(pager);
+  }
+
+  async function viewSubmittedPdf(row) {
+    if (!navigator.onLine) {
+      toast("No internet connection. Connect to view the PDF.", "error");
+      return;
+    }
+    toast("Loading PDF\u2026");
+    try {
+      const resp = await fetch(MWT_CONFIG.submitApiUrl, {
+        method: "POST",
+        headers: { "Content-Type": "text/plain;charset=utf-8" },
+        body: JSON.stringify({ action: "getSubmissionPdf", adminToken: getAdminToken(), submissionId: row.submissionId })
+      });
+      let payload = null;
+      try { payload = await resp.json(); } catch (e) { /* handled below */ }
+      if (!resp.ok || !payload || !payload.success) {
+        toast((payload && payload.error) ? payload.error : "Could not load that PDF.", "error");
+        return;
+      }
+      const byteChars = atob(payload.pdfBase64);
+      const bytes = new Uint8Array(byteChars.length);
+      for (let i = 0; i < byteChars.length; i++) bytes[i] = byteChars.charCodeAt(i);
+      const blob = new Blob([bytes], { type: "application/pdf" });
+      const url = URL.createObjectURL(blob);
+      openModal({
+        title: "Submitted PDF \u2014 " + (row.designFirm || "") + " \u2013 " + (row.sidemark || ""),
+        wide: true,
+        bodyNode: el("iframe", { class: "pdf-preview-frame", src: url }),
+        confirmLabel: "Close",
+        onConfirm: () => URL.revokeObjectURL(url),
+        hideCancel: true
+      });
+    } catch (err) {
+      toast("Could not reach the server. Check your connection and try again.", "error");
+    }
+  }
+
+  await loadAndRenderResults();
 }
 
 // ---------------------------------------------------------------
@@ -1506,11 +1887,17 @@ document.addEventListener("DOMContentLoaded", async () => {
   updateOfflineBanner();
 
   if (getDeviceToken()) {
-    // Already authorized on this iPad - go straight to the dashboard,
-    // no network call needed (keeps app opening fully offline-capable).
+    // Already authorized as Installer on this iPad - go straight to the
+    // dashboard, no network call needed (keeps app opening fully
+    // offline-capable).
     await refreshJobsCache();
+    await cleanupOldSubmittedJobs();
     render();
+  } else if (getAdminToken()) {
+    // Already authorized as Administrator - Submitted Jobs itself needs
+    // a connection to load, but opening the app does not.
+    renderAdminDashboard();
   } else {
-    renderAuthScreen();
+    renderAccessTypeScreen();
   }
 });
