@@ -34,8 +34,8 @@ const MWT_SOLD_TO_BILL_TO = {
     { id: "cityStateZip", label: "City/State/Zip", type: "text" },
     { id: "phone", label: "Phone", type: "text" },
     { id: "cell", label: "Cell", type: "text" },
-    { id: "email", label: "Email", type: "email", required: true,
-      help: "This address is used to email the Designer when the job is submitted." }
+    { id: "email", label: "Email", type: "email",
+      help: "Designer/Designer's email for a copy of this submission - optional, but you'll be asked to confirm before submitting without one." }
   ]
 };
 
@@ -130,11 +130,11 @@ const FORM_BLINDS_SHADES = {
       { id: "styleOrSize", label: "Style or Size", hint: "Fabric / Cell / Slat or Vane size" },
       { id: "colorName", label: "Color Name" },
       { id: "colorNo", label: "Color No." },
-      { id: "liftSystem", label: "Lift System", hint: "STD · UltraGlide · Cordless · Clutch · Motorized AC/DC · PowerView" },
+      { id: "liftSystem", label: "Lift System", hint: "Std · UltraGlide · Cordless · Clutch · Motorized AC/DC · PowerView" },
       { id: "powerOptions", label: "Power Options", hint: "Batt Wand · Rechrg · Plug-In · 3-Prong · \"X\" · See Below" },
       { id: "controls", label: "Controls", hint: "Tilt (L/R) · Lift (L/R)" },
-      { id: "stack", label: "Stack", hint: "STD · TDBU · TD · L · R · Split" },
-      { id: "fasciaVal", label: "Fascia / Val", hint: "STD · Cassette · Round · \"L\" · Exposed Roll · Reverse Roll" },
+      { id: "stack", label: "Stack", hint: "Std · TDBU · TD · L · R · Split" },
+      { id: "fasciaVal", label: "Fascia / Val", hint: "Std · Cassette · Round · \"L\" · Exposed Roll · Reverse Roll" },
       { id: "configuration", label: "Single / 2-on-1 / 3-on-1", type: "select",
         options: ["Single", "2-on-1", "3-on-1"] },
       { id: "mountType", label: "IB / OB / Ceiling", type: "select",
@@ -213,8 +213,8 @@ const FORM_SERVICE_REQUEST = {
       fields: [
         { id: "designerFirstLast", label: "Designer's First and Last Name", type: "text", required: true },
         { id: "designerCell", label: "Designer's Cell Phone #", type: "text", required: true },
-        { id: "designerEmail", label: "Designer's Email Address", type: "email", required: true,
-          help: "This address is used to email the Designer when the job is submitted." },
+        { id: "designerEmail", label: "Designer's Email Address", type: "email",
+          help: "Optional - but you'll be asked to confirm before submitting without one." },
         { id: "designerAddress", label: "Designer's Address", type: "text" },
         { id: "designerCity", label: "City", type: "text" },
         { id: "designerZip", label: "Zip Code", type: "text" },
