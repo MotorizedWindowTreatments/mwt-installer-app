@@ -699,6 +699,11 @@ button, input, select, textarea {
   outline: 2px solid var(--mwt-red);
   outline-offset: 1px;
 }
+.auth-pin-input.auth-password-input {
+  font-size: 17px;
+  letter-spacing: normal;
+  text-align: left;
+}
 
 .auth-error {
   min-height: 18px;
@@ -710,6 +715,80 @@ button, input, select, textarea {
 .auth-btn {
   width: 100%;
 }
+
+.auth-back-btn {
+  width: 100%;
+  margin-top: 8px;
+}
+
+/* ---------------- Select Access Type screen ---------------- */
+
+.access-type-card {
+  max-width: 420px;
+}
+.access-type-card h2 {
+  margin-bottom: 18px;
+}
+.access-type-btn {
+  display: block;
+  width: 100%;
+  text-align: left;
+  background: #fff;
+  border: 1px solid var(--mwt-border);
+  border-radius: 12px;
+  padding: 16px 18px;
+  margin-bottom: 12px;
+  cursor: pointer;
+  min-height: 64px;
+}
+.access-type-btn:hover {
+  border-color: var(--mwt-red);
+}
+.access-type-title {
+  font-weight: 700;
+  font-size: 16px;
+  color: var(--mwt-navy);
+  margin-bottom: 3px;
+}
+.access-type-desc {
+  font-size: 13px;
+  color: var(--mwt-muted);
+}
+
+/* ---------------- Administrator Dashboard ---------------- */
+
+.admin-wrap {
+  padding: 20px;
+  max-width: 1100px;
+  margin: 0 auto;
+}
+.admin-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 18px;
+}
+.admin-title {
+  font-size: 22px;
+  font-weight: 800;
+  color: var(--mwt-navy);
+}
+.admin-filter-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-bottom: 18px;
+}
+.admin-filter-bar input,
+.admin-filter-bar select {
+  flex: 1;
+  min-width: 140px;
+  padding: 10px 11px;
+  border: 1px solid var(--mwt-border);
+  border-radius: var(--radius);
+  min-height: 44px;
+}
+.admin-results { min-height: 100px; }
 
 /* ---------------- Empty state ---------------- */
 
@@ -742,33 +821,16 @@ button, input, select, textarea {
     z-index: 40;
     width: 82vw;
     max-width: 320px;
-
-    /* Keep sidebar content below the iPhone/iPad status bar */
     padding-top: env(safe-area-inset-top, 0px);
   }
-
-  #sidebar.open {
-    transform: translateX(0);
-    box-shadow: 0 0 30px rgba(0,0,0,0.3);
-  }
-
+  #sidebar.open { transform: translateX(0); box-shadow: 0 0 30px rgba(0,0,0,0.3); }
   #topbar {
-    /* Prevent menu/title from sitting underneath the iPhone status bar */
     padding-top: calc(10px + env(safe-area-inset-top, 0px));
     min-height: calc(56px + env(safe-area-inset-top, 0px));
   }
-
-  #topbar .menu-btn {
-    display: inline-block;
-    flex-shrink: 0;
-  }
-
+  #topbar .menu-btn { display: inline-block; flex-shrink: 0; }
   #content { padding: 14px; }
-
-  .action-bar {
-    margin: 18px -14px -14px;
-    padding: 12px 14px;
-  }
+  .action-bar { margin: 18px -14px -14px; padding: 12px 14px; }
 }
 
 @media (max-width: 480px) {
