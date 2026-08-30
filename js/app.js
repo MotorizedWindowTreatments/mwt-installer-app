@@ -1241,18 +1241,155 @@ function renderActionBar(job, schema) {
   return bar;
 }
 
-async function previewPdf(job, schema) {
-  try {
-    const blob = buildJobPdfBlob(job, schema);
+// Detects a touch/mobile device (iPhone, iPad/iPadOS, Android phone or
+// tablet) so PDF viewing can use a different, more reliable path there -
+// see showPdfDocument() below for why.
+function isMobileDevice() {
+  const ua = navigator.userAgent || "";
+  if (/iPhone|iPad|iPod|Android/i.test(ua)) return true;
+  // iPadOS 13+ reports itself as "Macintosh" in the UA string, but is
+  // still a touch device with no mouse - this catches that case too.
+  return /Macintosh/i.test(ua) && navigator.maxTouchPoints > 1;
+}
+
+function blobToDataUri(blob) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result); // full "data:application/pdf;base64,...." string
+    reader.onerror = () => reject(reader.error || new Error("Could not read the PDF."));
+    reader.readAsDataURL(blob);
+  });
+}
+
+// Shows a generated PDF (job.attachments preview or a fetched archived
+// PDF - either way, just a Blob) to the installer/admin.
+//
+// Desktop keeps the original approach: a Blob URL in an <iframe> inside
+// a modal - this already works correctly and is left exactly as it was.
+//
+// Mobile (iPhone, iPad, Android) does NOT use an iframe or a Blob URL at
+// all. Both turned out to be unreliable there in real testing: Safari's
+// iframe-embedded PDF renderer only shows the first page, and a Blob URL
+// handed to a new tab/window can't be resolved outside the tab that
+// created it (that's the Android "Open" button that does nothing).
+// Instead, the PDF is converted to a self-contained data: URI (which,
+// unlike a Blob URL, carries its own data and works across tabs/apps),
+// and the installer/admin is given explicit actions: "Open PDF" (a real
+// top-level navigation to a new tab, which lets the device's own full
+// PDF viewer render every page correctly instead of a cramped iframe),
+// "Share / Save PDF" via the native share sheet where supported, and
+// "Download PDF" as a dependable last resort - never a dead end.
+async function showPdfDocument(blob, opts) {
+  opts = opts || {};
+  const title = opts.title || "PDF";
+  const filename = opts.filename || "document.pdf";
+
+  if (!isMobileDevice()) {
     const url = URL.createObjectURL(blob);
     openModal({
-      title: "PDF Preview",
+      title,
       wide: true,
       bodyNode: el("iframe", { class: "pdf-preview-frame", src: url }),
       confirmLabel: "Close",
       onConfirm: () => URL.revokeObjectURL(url),
       hideCancel: true
     });
+    return;
+  }
+
+  // Mobile path - build the data: URI once and reuse it for every
+  // action below (nothing here is revoked/invalidated by using it).
+  let dataUri;
+  try {
+    dataUri = await blobToDataUri(blob);
+  } catch (err) {
+    toast("Could not prepare the PDF for viewing: " + err.message, "error");
+    return;
+  }
+
+  // Known platform limitation (still true as of 2026, confirmed across
+  // several years of WebKit bug reports with no full fix): window.open()
+  // is unreliable specifically inside an iOS PWA that's been installed
+  // to the Home Screen (standalone mode) - it can silently do nothing,
+  // independent of anything this app does. "Open PDF" below is still
+  // offered since it works fine in an ordinary browser tab (and often in
+  // standalone mode too), but it is NOT treated as the only or primary
+  // option - Share and Download do not depend on window.open at all, so
+  // one of them is guaranteed to work everywhere as a dependable
+  // fallback rather than leaving anyone stuck on a dead screen.
+  let shareFile = null;
+  if (navigator.canShare) {
+    try {
+      const candidate = new File([blob], filename, { type: "application/pdf" });
+      if (navigator.canShare({ files: [candidate] })) shareFile = candidate;
+    } catch (e) { /* navigator.canShare threw on this file type - just skip this option */ }
+  }
+
+  const actions = el("div", { class: "mobile-pdf-actions" });
+
+  // Native share sheet (Save to Files, AirDrop, Open in..., print, etc.)
+  // hands the actual file to the OS directly rather than navigating to
+  // it, so it isn't affected by the window.open/PWA issue above - where
+  // it's available (current iOS Safari/PWA and Android Chrome), it's the
+  // most dependable single action and is shown first.
+  if (shareFile) {
+    actions.appendChild(
+      el("button", {
+        class: "btn btn-navy",
+        onclick: async () => {
+          try {
+            await navigator.share({ files: [shareFile], title: filename });
+          } catch (shareErr) {
+            // user cancelled the share sheet - not an error
+          }
+        }
+      }, "\u2B06 Share / Save PDF")
+    );
+  }
+
+  actions.appendChild(
+    el("button", {
+      class: shareFile ? "btn btn-outline" : "btn btn-navy",
+      onclick: () => {
+        window.open(dataUri, "_blank");
+        // Deliberately no "did it work?" check here - a blocked/failed
+        // window.open() on some platforms (see note above) does not
+        // throw or return a reliable falsy value to detect, so Download
+        // PDF below is always present as the dependable path instead of
+        // guessing at an error message that may not be accurate.
+      }
+    }, "\uD83D\uDCC4 Open PDF")
+  );
+
+  actions.appendChild(
+    el("button", {
+      class: "btn btn-outline",
+      onclick: () => {
+        const a = document.createElement("a");
+        a.href = dataUri;
+        a.download = filename;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+      }
+    }, "\u2B07 Download PDF")
+  );
+
+  openModal({
+    title,
+    body: shareFile
+      ? "Choose how you'd like to view or save this PDF. Share / Save PDF is the most reliable option on this device."
+      : "Choose how you'd like to view or save this PDF. If Open PDF doesn't do anything, use Download PDF instead - it always works.",
+    bodyNode: actions,
+    confirmLabel: "Close",
+    hideCancel: true
+  });
+}
+
+async function previewPdf(job, schema) {
+  try {
+    const blob = buildJobPdfBlob(job, schema);
+    await showPdfDocument(blob, { title: "PDF Preview", filename: pdfFileName(job, schema) });
   } catch (err) {
     console.error(err);
     toast("Could not generate the PDF preview: " + err.message, "error");
@@ -1850,14 +1987,9 @@ async function renderAdminDashboard() {
       const bytes = new Uint8Array(byteChars.length);
       for (let i = 0; i < byteChars.length; i++) bytes[i] = byteChars.charCodeAt(i);
       const blob = new Blob([bytes], { type: "application/pdf" });
-      const url = URL.createObjectURL(blob);
-      openModal({
+      await showPdfDocument(blob, {
         title: "Submitted PDF \u2014 " + (row.designFirm || "") + " \u2013 " + (row.sidemark || ""),
-        wide: true,
-        bodyNode: el("iframe", { class: "pdf-preview-frame", src: url }),
-        confirmLabel: "Close",
-        onConfirm: () => URL.revokeObjectURL(url),
-        hideCancel: true
+        filename: payload.filename || row.pdfFilename || (row.submissionId + ".pdf")
       });
     } catch (err) {
       toast("Could not reach the server. Check your connection and try again.", "error");
