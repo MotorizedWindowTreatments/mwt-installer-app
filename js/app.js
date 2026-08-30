@@ -1241,149 +1241,129 @@ function renderActionBar(job, schema) {
   return bar;
 }
 
-// Detects a touch/mobile device (iPhone, iPad/iPadOS, Android phone or
-// tablet) so PDF viewing can use a different, more reliable path there -
-// see showPdfDocument() below for why.
-function isMobileDevice() {
-  const ua = navigator.userAgent || "";
-  if (/iPhone|iPad|iPod|Android/i.test(ua)) return true;
-  // iPadOS 13+ reports itself as "Macintosh" in the UA string, but is
-  // still a touch device with no mouse - this catches that case too.
-  return /Macintosh/i.test(ua) && navigator.maxTouchPoints > 1;
+// ---------------------------------------------------------------
+// PDF viewer (Preview PDF / Admin View PDF)
+//
+// Renders every page of the generated PDF directly inside the app
+// using PDF.js, as stacked <canvas> elements the user scrolls through
+// vertically - the same code path on desktop, iPhone, iPad, Android,
+// and installed PWA mode. There is no intermediate menu: tapping
+// Preview PDF (or View PDF) opens straight into the rendered pages.
+//
+// This replaces an earlier iframe/Blob-URL/data-URI approach that
+// looked reasonable in headless testing but failed on real iPhone/iPad
+// hardware (the iframe only rendered page 1; window.open() on a
+// data: URI opened a blank Safari tab). PDF.js sidesteps browser PDF
+// handling entirely by decoding and drawing the PDF itself, so there's
+// nothing platform-specific left to fail.
+// ---------------------------------------------------------------
+
+// Resolves a vendor/pdfjs file to an absolute URL relative to this
+// page's own location (works whether the app is hosted at a domain
+// root or under a subpath) - matches how every other vendor file in
+// this project (e.g. vendor/jspdf.umd.min.js) is referenced relative
+// to index.html, not relative to js/app.js.
+function pdfjsAssetUrl(filename) {
+  return new URL("vendor/pdfjs/" + filename, document.baseURI).href;
 }
 
-function blobToDataUri(blob) {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => resolve(reader.result); // full "data:application/pdf;base64,...." string
-    reader.onerror = () => reject(reader.error || new Error("Could not read the PDF."));
-    reader.readAsDataURL(blob);
-  });
+let _pdfjsLibPromise = null;
+function loadPdfJs() {
+  if (!_pdfjsLibPromise) {
+    _pdfjsLibPromise = import(pdfjsAssetUrl("pdf.min.mjs")).then((lib) => {
+      lib.GlobalWorkerOptions.workerSrc = pdfjsAssetUrl("pdf.worker.min.mjs");
+      return lib;
+    });
+  }
+  return _pdfjsLibPromise;
 }
 
-// Shows a generated PDF (job.attachments preview or a fetched archived
-// PDF - either way, just a Blob) to the installer/admin.
-//
-// Desktop keeps the original approach: a Blob URL in an <iframe> inside
-// a modal - this already works correctly and is left exactly as it was.
-//
-// Mobile (iPhone, iPad, Android) does NOT use an iframe or a Blob URL at
-// all. Both turned out to be unreliable there in real testing: Safari's
-// iframe-embedded PDF renderer only shows the first page, and a Blob URL
-// handed to a new tab/window can't be resolved outside the tab that
-// created it (that's the Android "Open" button that does nothing).
-// Instead, the PDF is converted to a self-contained data: URI (which,
-// unlike a Blob URL, carries its own data and works across tabs/apps),
-// and the installer/admin is given explicit actions: "Open PDF" (a real
-// top-level navigation to a new tab, which lets the device's own full
-// PDF viewer render every page correctly instead of a cramped iframe),
-// "Share / Save PDF" via the native share sheet where supported, and
-// "Download PDF" as a dependable last resort - never a dead end.
 async function showPdfDocument(blob, opts) {
   opts = opts || {};
   const title = opts.title || "PDF";
-  const filename = opts.filename || "document.pdf";
 
-  if (!isMobileDevice()) {
-    const url = URL.createObjectURL(blob);
-    openModal({
-      title,
-      wide: true,
-      bodyNode: el("iframe", { class: "pdf-preview-frame", src: url }),
-      confirmLabel: "Close",
-      onConfirm: () => URL.revokeObjectURL(url),
-      hideCancel: true
+  const overlay = el("div", { class: "pdf-viewer-overlay" });
+  const closeBtn = el("button", { class: "btn btn-outline pdf-viewer-close" }, "Close");
+  const bar = el("div", { class: "pdf-viewer-bar" }, [
+    el("div", { class: "pdf-viewer-title" }, title),
+    closeBtn
+  ]);
+  const pageList = el("div", { class: "pdf-page-list" },
+    el("div", { class: "help-text", style: "padding:30px;text-align:center;color:#fff;" }, "Loading PDF\u2026")
+  );
+  overlay.appendChild(bar);
+  overlay.appendChild(pageList);
+  document.body.appendChild(overlay);
+  document.body.classList.add("pdf-viewer-open");
+
+  let pdfDoc = null;
+  const renderedCanvases = [];
+
+  // Frees the decoded PDF and every rendered canvas's pixel buffer as
+  // soon as the preview closes, rather than leaving them for the
+  // garbage collector to get to eventually - matters on iPhone/iPad
+  // where a job's PDF can include several photo pages.
+  function cleanup() {
+    renderedCanvases.forEach((canvas) => {
+      const ctx = canvas.getContext("2d");
+      if (ctx) ctx.clearRect(0, 0, canvas.width, canvas.height);
+      canvas.width = 0;
+      canvas.height = 0;
     });
-    return;
+    renderedCanvases.length = 0;
+    if (pdfDoc) {
+      try { pdfDoc.destroy(); } catch (e) { /* ignore */ }
+      pdfDoc = null;
+    }
+    overlay.remove();
+    document.body.classList.remove("pdf-viewer-open");
   }
 
-  // Mobile path - build the data: URI once and reuse it for every
-  // action below (nothing here is revoked/invalidated by using it).
-  let dataUri;
+  closeBtn.addEventListener("click", cleanup);
+
   try {
-    dataUri = await blobToDataUri(blob);
+    const pdfjsLib = await loadPdfJs();
+    const arrayBuffer = await blob.arrayBuffer();
+    const loadingTask = pdfjsLib.getDocument({ data: arrayBuffer });
+    pdfDoc = await loadingTask.promise;
+
+    pageList.innerHTML = "";
+
+    // Fit each page to the available width. Resolution is capped
+    // (devicePixelRatio limited to 2x) so a high-DPI iPad doesn't render
+    // an unnecessarily huge canvas for every page of a multi-page,
+    // multi-photo PDF - and pages are rendered one at a time (awaited
+    // in sequence, not in parallel) to keep peak memory bounded rather
+    // than decoding every page's bitmap simultaneously.
+    const containerWidth = Math.max(Math.min(overlay.clientWidth || window.innerWidth, 900) - 24, 280);
+    const pixelRatio = Math.min(window.devicePixelRatio || 1, 2);
+
+    for (let pageNum = 1; pageNum <= pdfDoc.numPages; pageNum++) {
+      const page = await pdfDoc.getPage(pageNum);
+      const baseViewport = page.getViewport({ scale: 1 });
+      const fitScale = containerWidth / baseViewport.width;
+      const displayViewport = page.getViewport({ scale: fitScale });
+      const renderViewport = page.getViewport({ scale: fitScale * pixelRatio });
+
+      const canvas = el("canvas", { class: "pdf-page-canvas" });
+      canvas.width = Math.round(renderViewport.width);
+      canvas.height = Math.round(renderViewport.height);
+      canvas.style.width = Math.round(displayViewport.width) + "px";
+      canvas.style.height = Math.round(displayViewport.height) + "px";
+      pageList.appendChild(canvas);
+      renderedCanvases.push(canvas);
+
+      const ctx = canvas.getContext("2d");
+      await page.render({ canvasContext: ctx, viewport: renderViewport }).promise;
+      page.cleanup();
+    }
   } catch (err) {
-    toast("Could not prepare the PDF for viewing: " + err.message, "error");
-    return;
-  }
-
-  // Known platform limitation (still true as of 2026, confirmed across
-  // several years of WebKit bug reports with no full fix): window.open()
-  // is unreliable specifically inside an iOS PWA that's been installed
-  // to the Home Screen (standalone mode) - it can silently do nothing,
-  // independent of anything this app does. "Open PDF" below is still
-  // offered since it works fine in an ordinary browser tab (and often in
-  // standalone mode too), but it is NOT treated as the only or primary
-  // option - Share and Download do not depend on window.open at all, so
-  // one of them is guaranteed to work everywhere as a dependable
-  // fallback rather than leaving anyone stuck on a dead screen.
-  let shareFile = null;
-  if (navigator.canShare) {
-    try {
-      const candidate = new File([blob], filename, { type: "application/pdf" });
-      if (navigator.canShare({ files: [candidate] })) shareFile = candidate;
-    } catch (e) { /* navigator.canShare threw on this file type - just skip this option */ }
-  }
-
-  const actions = el("div", { class: "mobile-pdf-actions" });
-
-  // Native share sheet (Save to Files, AirDrop, Open in..., print, etc.)
-  // hands the actual file to the OS directly rather than navigating to
-  // it, so it isn't affected by the window.open/PWA issue above - where
-  // it's available (current iOS Safari/PWA and Android Chrome), it's the
-  // most dependable single action and is shown first.
-  if (shareFile) {
-    actions.appendChild(
-      el("button", {
-        class: "btn btn-navy",
-        onclick: async () => {
-          try {
-            await navigator.share({ files: [shareFile], title: filename });
-          } catch (shareErr) {
-            // user cancelled the share sheet - not an error
-          }
-        }
-      }, "\u2B06 Share / Save PDF")
+    console.error(err);
+    pageList.innerHTML = "";
+    pageList.appendChild(
+      el("div", { class: "needs-review-banner", style: "margin:20px;" }, "Could not display the PDF: " + err.message)
     );
   }
-
-  actions.appendChild(
-    el("button", {
-      class: shareFile ? "btn btn-outline" : "btn btn-navy",
-      onclick: () => {
-        window.open(dataUri, "_blank");
-        // Deliberately no "did it work?" check here - a blocked/failed
-        // window.open() on some platforms (see note above) does not
-        // throw or return a reliable falsy value to detect, so Download
-        // PDF below is always present as the dependable path instead of
-        // guessing at an error message that may not be accurate.
-      }
-    }, "\uD83D\uDCC4 Open PDF")
-  );
-
-  actions.appendChild(
-    el("button", {
-      class: "btn btn-outline",
-      onclick: () => {
-        const a = document.createElement("a");
-        a.href = dataUri;
-        a.download = filename;
-        document.body.appendChild(a);
-        a.click();
-        a.remove();
-      }
-    }, "\u2B07 Download PDF")
-  );
-
-  openModal({
-    title,
-    body: shareFile
-      ? "Choose how you'd like to view or save this PDF. Share / Save PDF is the most reliable option on this device."
-      : "Choose how you'd like to view or save this PDF. If Open PDF doesn't do anything, use Download PDF instead - it always works.",
-    bodyNode: actions,
-    confirmLabel: "Close",
-    hideCancel: true
-  });
 }
 
 async function previewPdf(job, schema) {
