@@ -1999,7 +1999,10 @@ async function renderAdminDashboard() {
         el("td", {}, r.projectNumber || "\u2014"),
         el("td", {}, r.formType || "\u2014"),
         el("td", {}, r.designerEmail || "\u2014"),
-        el("td", {}, el("button", { class: "btn btn-ghost", onclick: () => viewSubmittedPdf(r) }, "View PDF"))
+        el("td", {}, [
+          el("button", { class: "btn btn-ghost", onclick: () => viewSubmittedPdf(r) }, "View PDF"),
+          el("button", { class: "btn btn-ghost itinerary-admin-delete-btn", onclick: () => confirmDeleteSubmission(r) }, "Delete")
+        ])
       ]));
     });
     table.appendChild(tbody);
@@ -2040,6 +2043,50 @@ async function renderAdminDashboard() {
         title: "Submitted PDF \u2014 " + (row.designFirm || "") + " \u2013 " + (row.sidemark || ""),
         filename: payload.filename || row.pdfFilename || (row.submissionId + ".pdf")
       });
+    } catch (err) {
+      toast("Could not reach the server. Check your connection and try again.", "error");
+    }
+  }
+
+  // Admin-only, same safety pattern as the existing Weekly Itinerary
+  // delete: this whole "Submitted Jobs" section is only ever reached
+  // once already authorized as Administrator, so the button itself is
+  // never visible to an Installer; the backend's deleteSubmission
+  // action additionally requires a valid Admin token itself, enforced
+  // server-side, not just by hiding the button. Purely a central-
+  // archive action - never touches an installer's own local IndexedDB
+  // copy of the job.
+  function confirmDeleteSubmission(row) {
+    openModal({
+      title: "Delete this submitted job?",
+      body: "This will remove this job from the Administrator archive and move its archived PDF to Google Drive Trash. An email that was already sent cannot be recalled.",
+      confirmLabel: "Delete",
+      confirmClass: "btn-danger",
+      onConfirm: () => doDeleteSubmission(row)
+    });
+  }
+
+  async function doDeleteSubmission(row) {
+    if (!navigator.onLine) {
+      toast("No internet connection. Connect to delete this job.", "error");
+      return;
+    }
+    toast("Deleting\u2026");
+    try {
+      const resp = await fetch(MWT_CONFIG.submitApiUrl, {
+        method: "POST",
+        headers: { "Content-Type": "text/plain;charset=utf-8" },
+        body: JSON.stringify({ action: "deleteSubmission", adminToken: getAdminToken(), submissionId: row.submissionId })
+      });
+      let payload = null;
+      try { payload = await resp.json(); } catch (e) { /* handled below */ }
+      if (!resp.ok || !payload || !payload.success) {
+        // Row stays visible - do not remove anything from view on failure.
+        toast((payload && payload.error) ? payload.error : "Could not delete that job.", "error");
+        return;
+      }
+      toast("Job deleted.", "success");
+      await loadAndRenderResults();
     } catch (err) {
       toast("Could not reach the server. Check your connection and try again.", "error");
     }
