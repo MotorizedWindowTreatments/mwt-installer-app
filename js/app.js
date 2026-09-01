@@ -223,6 +223,12 @@ async function render() {
     content.appendChild(renderJobForm(job, state.currentSchema, { isNew: false }));
   } else if (state.route.type === "savedJobs") {
     content.appendChild(await renderSavedJobsList(state.route.filterStatus || null));
+  } else if (state.route.type === "itineraryHome") {
+    await renderItineraryHomeRoute(content);
+  } else if (state.route.type === "itineraryEditor") {
+    content.appendChild(await renderItineraryEditorRoute(state.route.itineraryId));
+  } else if (state.route.type === "itineraryList") {
+    content.appendChild(await renderItineraryListRoute());
   }
 
   document.getElementById("topbar-title").textContent = topbarTitle();
@@ -235,6 +241,8 @@ function topbarTitle() {
   if (state.route.type === "newJob") return "New " + (getFormSchema(state.route.formId)?.label || "Job");
   if (state.route.type === "editJob") return state.currentJob ? computeDisplayName(state.currentJob) : "Job";
   if (state.route.type === "savedJobs") return "Saved Jobs";
+  if (state.route.type === "itineraryHome" || state.route.type === "itineraryEditor") return "Weekly Itinerary";
+  if (state.route.type === "itineraryList") return "Weekly Itineraries";
   return "MWT Installer";
 }
 
@@ -260,6 +268,15 @@ function renderSidebar() {
     );
     newGroup.appendChild(btn);
   });
+  // Weekly Itinerary - a special workflow, not a form schema, so it's
+  // added directly here rather than coming from the MWT_FORM_SCHEMAS
+  // loop above. Defined in js/itinerary.js.
+  newGroup.appendChild(
+    el("button", {
+      class: "nav-item" + (state.route.type === "itineraryHome" || state.route.type === "itineraryEditor" ? " active" : ""),
+      onclick: () => { closeSidebarMobile(); goTo({ type: "itineraryHome" }); }
+    }, "+ Weekly Itinerary")
+  );
   nav.appendChild(newGroup);
 
   const dashBtn = el(
@@ -279,8 +296,22 @@ function renderSidebar() {
   const jobList = el("div", { id: "sidebar-job-list" });
   savedGroup.appendChild(jobList);
 
+  // Weekly Itineraries - a lightweight link to the itinerary list,
+  // mirroring "Saved Jobs" above but for the separate itineraries
+  // store (js/itinerary.js). Kept as its own small group rather than
+  // merged into Saved Jobs since itineraries are a different record
+  // type entirely.
+  const itineraryGroup = el("div", { class: "nav-group" }, [
+    el("h4", {}, "Weekly Itineraries"),
+    el("button", {
+      class: "nav-item" + (state.route.type === "itineraryList" ? " active" : ""),
+      onclick: () => { closeSidebarMobile(); goTo({ type: "itineraryList" }); }
+    }, "\uD83D\uDDD3\uFE0F View All Itineraries")
+  ]);
+
   nav.prepend(dashBtn);
   nav.appendChild(savedGroup);
+  nav.appendChild(itineraryGroup);
   nav.appendChild(renderBackupGroup());
   nav.appendChild(renderAccountGroup());
 
@@ -470,6 +501,12 @@ async function renderDashboard() {
     );
   });
   wrap.appendChild(tiles);
+
+  // Weekly Itinerary - a distinct workflow, not one of the order-form
+  // schemas, so it isn't part of the MWT_FORM_SCHEMAS loop above. Added
+  // as a 4th tile in the same grid so it reads as one more dashboard
+  // option to installers. Defined in js/itinerary.js.
+  tiles.appendChild(renderItineraryDashboardTile());
 
   const recent = state.jobsCache.slice(0, 8);
   wrap.appendChild(
@@ -1737,6 +1774,7 @@ function renderAuthScreen(role) {
             document.getElementById("topbar").style.display = "";
             await refreshJobsCache();
             await cleanupOldSubmittedJobs();
+            await cleanupOldSubmittedItineraries();
             render();
           }
         }, 900);
@@ -1805,6 +1843,12 @@ const adminState = {
   error: ""
 };
 
+// Which Admin tab is showing - "jobs" (Submitted Jobs, existing/
+// untouched) or "itineraries" (Weekly Itineraries, new). Kept as a
+// tiny piece of module state so switching tabs just re-renders the
+// same dashboard function with a different branch taken.
+let adminActiveTab = "jobs";
+
 async function renderAdminDashboard() {
   document.getElementById("sidebar").style.display = "none";
   document.getElementById("topbar").style.display = "none";
@@ -1814,7 +1858,7 @@ async function renderAdminDashboard() {
   const wrap = el("div", { class: "admin-wrap" });
 
   const header = el("div", { class: "admin-header" }, [
-    el("div", { class: "admin-title" }, "Submitted Jobs"),
+    el("div", { class: "admin-title" }, adminActiveTab === "jobs" ? "Submitted Jobs" : "Weekly Itineraries"),
     el("button", {
       class: "btn btn-outline",
       onclick: () => {
@@ -1830,7 +1874,33 @@ async function renderAdminDashboard() {
   ]);
   wrap.appendChild(header);
 
+  // Tab bar - Submitted Jobs / Weekly Itineraries. Switching tabs just
+  // re-renders this same function with adminActiveTab changed; the
+  // Submitted Jobs branch below is completely unchanged from before
+  // this feature existed.
+  const tabBar = el("div", { class: "admin-tab-bar" }, [
+    el("button", {
+      class: "admin-tab-btn" + (adminActiveTab === "jobs" ? " active" : ""),
+      onclick: () => { adminActiveTab = "jobs"; renderAdminDashboard(); }
+    }, "Submitted Jobs"),
+    el("button", {
+      class: "admin-tab-btn" + (adminActiveTab === "itineraries" ? " active" : ""),
+      onclick: () => { adminActiveTab = "itineraries"; renderAdminDashboard(); }
+    }, "Weekly Itineraries")
+  ]);
+  wrap.appendChild(tabBar);
+
   const filterBar = el("div", { class: "admin-filter-bar" });
+  const resultsBox = el("div", { class: "admin-results" });
+
+  if (adminActiveTab === "itineraries") {
+    wrap.appendChild(filterBar);
+    wrap.appendChild(resultsBox);
+    content.appendChild(wrap);
+    await renderItineraryAdminSection(resultsBox, filterBar);
+    return;
+  }
+
   const dfInput = el("input", { type: "text", placeholder: "Design Firm", value: adminState.designFirm });
   const sideInput = el("input", { type: "text", placeholder: "Sidemark", value: adminState.sidemark });
   const projInput = el("input", { type: "text", placeholder: "MWT Project #", value: adminState.projectNumber });
@@ -1860,7 +1930,6 @@ async function renderAdminDashboard() {
   filterBar.appendChild(searchBtn);
   wrap.appendChild(filterBar);
 
-  const resultsBox = el("div", { class: "admin-results" });
   wrap.appendChild(resultsBox);
 
   content.appendChild(wrap);
@@ -2004,6 +2073,7 @@ document.addEventListener("DOMContentLoaded", async () => {
     // offline-capable).
     await refreshJobsCache();
     await cleanupOldSubmittedJobs();
+    await cleanupOldSubmittedItineraries();
     render();
   } else if (getAdminToken()) {
     // Already authorized as Administrator - Submitted Jobs itself needs
