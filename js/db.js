@@ -7,8 +7,9 @@
    ============================================================ */
 
 const MWT_DB_NAME = "mwt_installer_db";
-const MWT_DB_VERSION = 1;
+const MWT_DB_VERSION = 2;
 const MWT_STORE_JOBS = "jobs";
+const MWT_STORE_ITINERARIES = "itineraries";
 
 let _dbPromise = null;
 
@@ -27,6 +28,19 @@ function openDb() {
         store.createIndex("status", "status", { unique: false });
         store.createIndex("lastModified", "lastModified", { unique: false });
         store.createIndex("formType", "formType", { unique: false });
+      }
+      // Weekly Itinerary uses its own object store, kept completely
+      // separate from "jobs" - added here as a new store only; the
+      // existing "jobs" store and its data are untouched by this
+      // upgrade. Keeping the two apart means every existing job-listing
+      // function (sidebar, dashboard, Saved Jobs, search, Duplicate,
+      // Delete) needs zero changes and can never accidentally show or
+      // touch an itinerary record.
+      if (!db.objectStoreNames.contains(MWT_STORE_ITINERARIES)) {
+        const istore = db.createObjectStore(MWT_STORE_ITINERARIES, { keyPath: "id" });
+        istore.createIndex("status", "status", { unique: false });
+        istore.createIndex("lastModified", "lastModified", { unique: false });
+        istore.createIndex("weekStart", "weekStart", { unique: false });
       }
     };
     req.onsuccess = (e) => resolve(e.target.result);
@@ -85,5 +99,50 @@ const MwtDB = {
     } catch (e) {
       return 0;
     }
+  }
+};
+
+// Weekly Itinerary storage - identical shape to MwtDB above, pointed at
+// the separate "itineraries" store. Kept as its own object (rather than
+// parameterizing MwtDB) so MwtDB's own code above never has to change.
+const MwtItineraryDB = {
+  async saveItinerary(itinerary) {
+    const db = await openDb();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(MWT_STORE_ITINERARIES, "readwrite");
+      tx.objectStore(MWT_STORE_ITINERARIES).put(itinerary);
+      tx.oncomplete = () => resolve(itinerary);
+      tx.onerror = () => reject(tx.error);
+    });
+  },
+
+  async getItinerary(id) {
+    const db = await openDb();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(MWT_STORE_ITINERARIES, "readonly");
+      const req = tx.objectStore(MWT_STORE_ITINERARIES).get(id);
+      req.onsuccess = () => resolve(req.result || null);
+      req.onerror = () => reject(req.error);
+    });
+  },
+
+  async getAllItineraries() {
+    const db = await openDb();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(MWT_STORE_ITINERARIES, "readonly");
+      const req = tx.objectStore(MWT_STORE_ITINERARIES).getAll();
+      req.onsuccess = () => resolve(req.result || []);
+      req.onerror = () => reject(req.error);
+    });
+  },
+
+  async deleteItinerary(id) {
+    const db = await openDb();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(MWT_STORE_ITINERARIES, "readwrite");
+      tx.objectStore(MWT_STORE_ITINERARIES).delete(id);
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
   }
 };
