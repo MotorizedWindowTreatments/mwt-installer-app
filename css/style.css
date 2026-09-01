@@ -1136,3 +1136,10 @@ body.pdf-viewer-open {
   .itinerary-job-row { grid-template-columns: 1fr; }
   .itinerary-mileage-grid { grid-template-columns: 1fr; }
 }
+
+/* Weekly Itinerary Admin: Delete button sits next to View PDF in the
+   same cell - small left margin only, does not touch .btn-ghost or
+   .job-table styles used elsewhere (e.g. Submitted Jobs). */
+.itinerary-admin-delete-btn {
+  margin-left: 6px;
+}
