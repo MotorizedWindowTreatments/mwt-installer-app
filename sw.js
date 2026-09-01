@@ -11,7 +11,7 @@
    the update instead of a stale cached copy.
    ============================================================ */
 
-const CACHE_NAME = "mwt-installer-shell-v4";
+const CACHE_NAME = "mwt-installer-shell-v7";
 
 const CORE_ASSETS = [
   "./",
@@ -23,6 +23,7 @@ const CORE_ASSETS = [
   "./js/db.js",
   "./js/pdf.js",
   "./js/app.js",
+  "./js/itinerary.js",
   "./vendor/jspdf.umd.min.js",
   "./vendor/jspdf.plugin.autotable.min.js",
   "./vendor/pdfjs/pdf.min.mjs",
