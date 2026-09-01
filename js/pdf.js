@@ -414,7 +414,11 @@ function buildItineraryPdfBlob(itinerary, opts) {
     doc.setFontSize(10.5);
     doc.text(title.toUpperCase(), marginX + 6, y + 13);
     doc.setTextColor(0, 0, 0);
-    y += 24;
+    // Bar itself is 18pt tall; advancing by 32 (rather than 24) leaves
+    // ~14pt of clear space below the bar before the next line (Start /
+    // Finish / Hours for a day header, or the summary table) instead of
+    // the previous ~6pt, which read as touching/overlapping the header.
+    y += 32;
   }
 
   function labelValueLine(label, value) {
