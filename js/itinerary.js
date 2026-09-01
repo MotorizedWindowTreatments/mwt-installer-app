@@ -191,6 +191,25 @@ async function findItineraryByInstallerAndWeek(installerName, weekStart) {
 // identity first, then finding-or-creating the record for the NEW
 // identity and navigating there - never carrying days/jobs/hours/
 // mileage across to a different installer or week.
+// Shared by both the initial installer-selection screen and
+// switchItineraryContext() below - looks up (or creates) the record for
+// an ALREADY-resolved installer name + week, remembers the choice, and
+// navigates to it. Never touches any other itinerary.
+async function openOrCreateItineraryFor(preset, resolvedName, weekStart) {
+  try {
+    localStorage.setItem(ITINERARY_LAST_PRESET_KEY, preset);
+    localStorage.setItem(ITINERARY_LAST_OTHER_NAME_KEY, preset === "Other" ? resolvedName : "");
+  } catch (e) { /* ignore */ }
+
+  let target = await findItineraryByInstallerAndWeek(resolvedName, weekStart);
+  if (!target) {
+    target = blankItinerary(preset, weekStart);
+    if (preset === "Other") target.installerNameOther = resolvedName;
+    await persistItinerary(target, { silent: true });
+  }
+  goTo({ type: "itineraryEditor", itineraryId: target.id });
+}
+
 // Requires an already-resolved, non-empty installer name - callers for
 // "Other" must obtain that name via openOtherInstallerNameModal() BEFORE
 // ever calling this, so this function is never in a position to touch
@@ -211,25 +230,14 @@ async function switchItineraryContext(itinerary, newPreset, newResolvedName, new
   if (oldName) {
     await persistItinerary(itinerary, { silent: true });
   } else {
-    // This was only an unidentified placeholder (a brand-new device,
-    // before any installer had ever been chosen) - remove it rather
-    // than leaving an empty "Unnamed" record behind now that a real
-    // identity is being chosen.
+    // Defensive only - nothing creates an unidentified placeholder
+    // record anymore (see renderItineraryHomeRoute below), so this
+    // branch should be unreachable in practice; kept as a safety net
+    // rather than removed.
     try { await MwtItineraryDB.deleteItinerary(itinerary.id); } catch (e) { /* ignore */ }
   }
 
-  try {
-    localStorage.setItem(ITINERARY_LAST_PRESET_KEY, newPreset);
-    localStorage.setItem(ITINERARY_LAST_OTHER_NAME_KEY, newPreset === "Other" ? newResolvedName : "");
-  } catch (e) { /* ignore */ }
-
-  let target = await findItineraryByInstallerAndWeek(newResolvedName, newWeekStart);
-  if (!target) {
-    target = blankItinerary(newPreset, newWeekStart);
-    if (newPreset === "Other") target.installerNameOther = newResolvedName;
-    await persistItinerary(target, { silent: true });
-  }
-  goTo({ type: "itineraryEditor", itineraryId: target.id });
+  await openOrCreateItineraryFor(newPreset, newResolvedName, newWeekStart);
 }
 
 // Changing the WEEK while no installer has been chosen yet (still on
@@ -418,29 +426,37 @@ async function renderItineraryHomeRoute(content) {
 
   const weekStart = itnCurrentWeekStart();
 
-  if (!lastPreset) {
-    // Brand-new device - no installer has ever been chosen here yet.
-    // Do NOT silently assume "Bill": show the editor on an unidentified
-    // placeholder record so the installer can pick who they are. This
-    // placeholder is saved so its id is always resolvable, but has no
-    // real installer identity yet, and is cleaned up automatically
-    // (see switchItineraryContext) the moment a real one is chosen.
-    const placeholder = blankItinerary("", weekStart);
-    await persistItinerary(placeholder, { silent: true });
-    state.route = { type: "itineraryEditor", itineraryId: placeholder.id };
-    content.appendChild(renderItineraryEditor(placeholder));
-    return;
-  }
+  // Opening Weekly Itinerary must NEVER create or save a record by
+  // itself - this screen only ever reads localStorage to visually
+  // highlight the last-used installer as a convenience. No itinerary is
+  // looked up, created, or persisted until the installer explicitly
+  // taps a preset (or confirms a name via the Other modal), which is
+  // what openOrCreateItineraryFor() below actually does.
+  const wrap = el("div", { class: "itinerary-editor" });
+  const card = el("div", { class: "card itinerary-card" });
+  card.appendChild(el("h3", {}, "Weekly Itinerary"));
+  card.appendChild(el("p", { class: "help-text" }, "Select an installer to open or start the itinerary for " + itnFormatWeekRangeSpaced(weekStart) + "."));
 
-  const installerName = lastPreset === "Other" ? lastOtherName : lastPreset;
-  let itinerary = await findItineraryByInstallerAndWeek(installerName, weekStart);
-  if (!itinerary) {
-    itinerary = blankItinerary(lastPreset, weekStart);
-    if (lastPreset === "Other") itinerary.installerNameOther = lastOtherName;
-    await persistItinerary(itinerary, { silent: true });
-  }
-  state.route = { type: "itineraryEditor", itineraryId: itinerary.id };
-  content.appendChild(await renderItineraryEditorRoute(itinerary));
+  const presetRow = el("div", { class: "itinerary-preset-row" });
+  ITINERARY_INSTALLER_PRESETS.forEach((preset) => {
+    presetRow.appendChild(
+      el("button", {
+        class: "itinerary-preset-btn" + (lastPreset === preset ? " active" : ""),
+        onclick: () => {
+          if (preset === "Other") {
+            openOtherInstallerNameModal(lastPreset === "Other" ? lastOtherName : "", (name) => {
+              openOrCreateItineraryFor("Other", name, weekStart);
+            });
+          } else {
+            openOrCreateItineraryFor(preset, preset, weekStart);
+          }
+        }
+      }, preset)
+    );
+  });
+  card.appendChild(presetRow);
+  wrap.appendChild(card);
+  content.appendChild(wrap);
 }
 
 async function renderItineraryEditorRoute(itineraryOrId) {
