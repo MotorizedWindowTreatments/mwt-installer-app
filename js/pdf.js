@@ -382,3 +382,184 @@ function buildJobPdfBlob(job, schema) {
 
   return doc.output("blob");
 }
+
+// ---------------------------------------------------------------
+// Weekly Itinerary PDF - entirely separate from buildJobPdfBlob() above
+// (its own local helpers, does not call or modify anything in that
+// function). Professional layout, not a redraw of the Excel sheet.
+// ---------------------------------------------------------------
+function buildItineraryPdfBlob(itinerary, opts) {
+  opts = opts || {};
+  const { jsPDF } = window.jspdf;
+  const doc = new jsPDF({ orientation: "portrait", unit: "pt", format: "letter" });
+
+  const marginX = 36;
+  let y = 40;
+  const pageWidth = doc.internal.pageSize.getWidth();
+  const pageHeight = doc.internal.pageSize.getHeight();
+
+  function ensureSpace(h) {
+    if (y + h > pageHeight - 50) {
+      doc.addPage();
+      y = 40;
+    }
+  }
+
+  function sectionTitle(title) {
+    ensureSpace(24);
+    doc.setFillColor(22, 35, 63);
+    doc.rect(marginX, y, pageWidth - marginX * 2, 18, "F");
+    doc.setTextColor(255, 255, 255);
+    doc.setFont("helvetica", "bold");
+    doc.setFontSize(10.5);
+    doc.text(title.toUpperCase(), marginX + 6, y + 13);
+    doc.setTextColor(0, 0, 0);
+    y += 24;
+  }
+
+  function labelValueLine(label, value) {
+    const text = label + ": " + (value !== undefined && value !== null && String(value).trim() ? value : "\u2014");
+    doc.setFont("helvetica", "normal");
+    doc.setFontSize(9.5);
+    const usableWidth = pageWidth - marginX * 2;
+    const lines = doc.splitTextToSize(text, usableWidth);
+    ensureSpace(lines.length * 12 + 4);
+    lines.forEach((line, i) => {
+      if (i === 0) {
+        const labelPart = label + ": ";
+        doc.setFont("helvetica", "bold");
+        doc.text(labelPart, marginX, y);
+        const labelWidth = doc.getTextWidth(labelPart);
+        doc.setFont("helvetica", "normal");
+        doc.text(line.slice(labelPart.length), marginX + labelWidth, y);
+      } else {
+        doc.text(line, marginX, y);
+      }
+      y += 12;
+    });
+    y += 2;
+  }
+
+  const installerName = itineraryInstallerName(itinerary) || "\u2014";
+  const weekRangeText = itnFormatWeekRangeSpaced(itinerary.weekStart);
+
+  // Header
+  doc.setFillColor(22, 35, 63);
+  doc.rect(0, 0, pageWidth, 54, "F");
+  doc.setTextColor(255, 255, 255);
+  doc.setFont("helvetica", "bold");
+  doc.setFontSize(16);
+  doc.text("Motorized Window Treatments", marginX, 22);
+  doc.setFontSize(11);
+  doc.setFont("helvetica", "normal");
+  doc.text("Weekly Itinerary", marginX, 40);
+  doc.setFontSize(10);
+  const rightLines = [
+    // The PDF generated specifically for a successful submission passes
+    // opts.statusOverride ("SUBMITTED") explicitly, since at PDF-build
+    // time the local record's own status is still "draft"/"ready" - it
+    // only flips to "submitted" after the backend confirms success,
+    // which must happen after the PDF (and therefore the email) is
+    // already on its way. Preview PDF (no override) still shows the
+    // record's real current status, which is the useful/expected thing
+    // there.
+    "Status: " + (opts.statusOverride || itinerary.status.toUpperCase()),
+    "Generated: " + new Date().toLocaleString()
+  ];
+  rightLines.forEach((line, i) => {
+    doc.text(line, pageWidth - marginX, 16 + i * 12, { align: "right" });
+  });
+  doc.setTextColor(0, 0, 0);
+  y = 70;
+
+  doc.setFont("helvetica", "bold");
+  doc.setFontSize(13);
+  doc.text("Installer: " + installerName, marginX, y);
+  y += 18;
+  doc.setFontSize(12);
+  doc.text("Week: " + weekRangeText, marginX, y);
+  y += 20;
+
+  // Each day
+  ITINERARY_DAY_KEYS.forEach((dayKey, idx) => {
+    const day = itinerary.days[dayKey];
+    const dateLabel = itnFormatDayTabLabel(dayKey, itinerary.weekStart);
+    sectionTitle(ITINERARY_DAY_FULL_LABELS[dayKey] + " \u00b7 " + dateLabel);
+
+    const hoursResult = itnComputeDayHours(day);
+    const hoursText = hoursResult.error ? hoursResult.error : hoursResult.hours.toFixed(2) + " hrs";
+    labelValueLine("Start / Finish / Hours", (day.startTime || "\u2014") + "  /  " + (day.finishTime || "\u2014") + "  /  " + hoursText);
+
+    const jobs = (day.jobs || []).filter((j) => j.customer || j.workPerformed || j.product);
+    if (jobs.length) {
+      const head = [["Customer", "Work Performed", "Product"]];
+      const bodyRows = jobs.map((j) => [j.customer || "\u2014", j.workPerformed || "\u2014", j.product || "\u2014"]);
+      doc.autoTable({
+        startY: y,
+        head,
+        body: bodyRows,
+        margin: { left: marginX, right: marginX },
+        styles: { fontSize: 9, cellPadding: 4, overflow: "linebreak" },
+        headStyles: { fillColor: [192, 57, 43], textColor: 255, fontSize: 9 },
+        theme: "grid"
+      });
+      y = doc.lastAutoTable.finalY + 8;
+    } else {
+      doc.setFont("helvetica", "italic");
+      doc.setFontSize(9);
+      doc.setTextColor(120, 120, 120);
+      ensureSpace(14);
+      doc.text("No jobs logged for this day.", marginX, y);
+      doc.setTextColor(0, 0, 0);
+      y += 16;
+    }
+
+    const milesResult = itnComputeDayMiles(day);
+    const milesText = milesResult.error ? milesResult.error : String(milesResult.miles) + " mi";
+    labelValueLine(
+      "Mileage",
+      "Start " + (day.startMileage || "\u2014") + "  \u00b7  End " + (day.endMileage || "\u2014") + "  \u00b7  Total " + milesText
+    );
+    labelValueLine("Tolls / Parking & Fuel", "$" + (parseFloat(day.tolls) || 0).toFixed(2) + "  /  $" + (parseFloat(day.parkingFuel) || 0).toFixed(2));
+    y += 4;
+  });
+
+  // Weekly Summary
+  const totals = computeItineraryTotals(itinerary);
+  sectionTitle("Weekly Summary");
+  const summaryRows = [
+    ["Total Hours", totals.totalHours.toFixed(2)],
+    ["Installs", String(totals.installs)],
+    ["Measures", String(totals.measures)],
+    ["Cut-Downs / Retrofits", String(totals.cutDownRetrofits)],
+    ["Service Calls", String(totals.serviceCalls)],
+    ["Total Miles", totals.totalMiles.toFixed(1)],
+    ["Mileage Reimbursement (@ $0.30/mi)", "$" + totals.mileageReimbursement.toFixed(2)],
+    ["Parking / Fuel", "$" + totals.parkingFuel.toFixed(2)],
+    ["Tolls", "$" + totals.tolls.toFixed(2)],
+    ["Total Reimbursable Expenses", "$" + totals.totalReimbursable.toFixed(2)]
+  ];
+  doc.autoTable({
+    startY: y,
+    body: summaryRows,
+    margin: { left: marginX, right: marginX },
+    styles: { fontSize: 10, cellPadding: 5 },
+    columnStyles: { 0: { fontStyle: "bold" }, 1: { halign: "right" } },
+    theme: "grid"
+  });
+  y = doc.lastAutoTable.finalY + 10;
+
+  // Footer + page numbers
+  const pageCount = doc.internal.getNumberOfPages();
+  for (let i = 1; i <= pageCount; i++) {
+    doc.setPage(i);
+    doc.setFont("helvetica", "italic");
+    doc.setFontSize(7.5);
+    doc.setTextColor(110, 110, 110);
+    doc.text("MWT Installer \u2013 Weekly Itinerary \u2013 " + installerName + " \u2013 " + weekRangeText, marginX, pageHeight - 22);
+    doc.text("Page " + i + " of " + pageCount, pageWidth - marginX, pageHeight - 10, { align: "right" });
+    doc.setTextColor(0, 0, 0);
+  }
+
+  return doc.output("blob");
+}
