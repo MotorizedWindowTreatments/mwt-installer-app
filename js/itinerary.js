@@ -1151,7 +1151,10 @@ async function renderItineraryAdminSection(resultsBox, filterBar) {
         el("td", {}, (r.weekStart && r.weekEnd) ? itnFormatWeekRange(r.weekStart) : "\u2014"),
         el("td", {}, r.totalHours != null ? Number(r.totalHours).toFixed(2) : "\u2014"),
         el("td", {}, r.totalReimbursable != null ? "$" + Number(r.totalReimbursable).toFixed(2) : "\u2014"),
-        el("td", {}, el("button", { class: "btn btn-ghost", onclick: () => viewItineraryPdf(r) }, "View PDF"))
+        el("td", {}, [
+          el("button", { class: "btn btn-ghost", onclick: () => viewItineraryPdf(r) }, "View PDF"),
+          el("button", { class: "btn btn-ghost itinerary-admin-delete-btn", onclick: () => confirmDeleteItinerary(r) }, "Delete")
+        ])
       ]));
     });
     table.appendChild(tbody);
@@ -1185,6 +1188,50 @@ async function renderItineraryAdminSection(resultsBox, filterBar) {
       for (let i = 0; i < byteChars.length; i++) bytes[i] = byteChars.charCodeAt(i);
       const blob = new Blob([bytes], { type: "application/pdf" });
       await showPdfDocument(blob, { title: "Weekly Itinerary \u2014 " + (row.installerName || "") });
+    } catch (err) {
+      toast("Could not reach the server. Check your connection and try again.", "error");
+    }
+  }
+
+  // Admin-only - this whole section is only ever reached once already
+  // authorized as Administrator (see renderAdminDashboard() in app.js),
+  // so no separate role check is needed here for the button itself to
+  // stay hidden from Installers; the backend's deleteItinerary action
+  // additionally requires a valid Admin token itself, so this is
+  // enforced server-side too, not just by hiding the button. Purely a
+  // central-archive action - never touches anything in this device's
+  // own local IndexedDB (installers' local copies are untouched).
+  function confirmDeleteItinerary(row) {
+    openModal({
+      title: "Permanently remove this Weekly Itinerary from the Admin archive?",
+      body: "The archived PDF will be moved to Google Drive Trash, and the submission record will be removed from the Weekly Itineraries Sheet tab. An email that was already sent cannot be recalled.",
+      confirmLabel: "Delete",
+      confirmClass: "btn-danger",
+      onConfirm: () => doDeleteItinerary(row)
+    });
+  }
+
+  async function doDeleteItinerary(row) {
+    if (!navigator.onLine) {
+      toast("No internet connection. Connect to delete this itinerary.", "error");
+      return;
+    }
+    toast("Deleting\u2026");
+    try {
+      const resp = await fetch(MWT_CONFIG.submitApiUrl, {
+        method: "POST",
+        headers: { "Content-Type": "text/plain;charset=utf-8" },
+        body: JSON.stringify({ action: "deleteItinerary", adminToken: getAdminToken(), submissionId: row.submissionId })
+      });
+      let payload = null;
+      try { payload = await resp.json(); } catch (e) { /* handled below */ }
+      if (!resp.ok || !payload || !payload.success) {
+        // Row stays visible - do not remove anything from view on failure.
+        toast((payload && payload.error) ? payload.error : "Could not delete that weekly itinerary.", "error");
+        return;
+      }
+      toast("Weekly itinerary deleted.", "success");
+      await loadAndRender();
     } catch (err) {
       toast("Could not reach the server. Check your connection and try again.", "error");
     }
