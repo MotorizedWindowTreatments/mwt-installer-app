@@ -837,6 +837,17 @@ body.pdf-viewer-open {
   border-radius: var(--radius);
   min-height: 44px;
 }
+.itinerary-admin-date-label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--mwt-muted);
+  flex: 1;
+  min-width: 150px;
+}
+.itinerary-admin-date-label input { width: 100%; }
 .admin-results { min-height: 100px; }
 
 /* ---------------- Empty state ---------------- */
@@ -884,4 +895,244 @@ body.pdf-viewer-open {
 
 @media (max-width: 480px) {
   .field-grid { grid-template-columns: 1fr; }
+}
+
+/* ---------------- Weekly Itinerary ---------------- */
+
+.itinerary-editor { max-width: 900px; margin: 0 auto; }
+
+.itinerary-card { margin-bottom: 16px; }
+.itinerary-card h3 { margin-top: 0; }
+.itinerary-card h4 { margin: 0 0 10px; font-size: 14px; color: var(--mwt-navy); }
+
+.itinerary-preset-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.itinerary-preset-btn {
+  flex: 1 1 auto;
+  min-width: 80px;
+  min-height: 46px;
+  padding: 10px 14px;
+  border: 1px solid var(--mwt-border);
+  border-radius: var(--radius);
+  background: #fff;
+  font-weight: 600;
+  cursor: pointer;
+}
+.itinerary-preset-btn.active {
+  background: var(--mwt-navy);
+  color: #fff;
+  border-color: var(--mwt-navy);
+}
+.itinerary-other-label {
+  display: block;
+  margin-top: 12px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--mwt-navy);
+}
+.itinerary-other-input {
+  display: block;
+  width: 100%;
+  min-height: 46px;
+  padding: 10px 12px;
+  margin-top: 6px;
+  border: 1px solid var(--mwt-border);
+  border-radius: var(--radius);
+  font-size: 15px;
+}
+
+.itinerary-week-nav {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+}
+.itinerary-week-arrow {
+  min-width: 48px;
+  min-height: 48px;
+  font-size: 22px;
+  line-height: 1;
+  font-weight: 700;
+  padding: 0;
+}
+.itinerary-week-range {
+  font-size: 17px;
+  font-weight: 700;
+  color: var(--mwt-navy);
+  min-width: 200px;
+  text-align: center;
+}
+
+.itinerary-day-tabs {
+  display: grid;
+  grid-template-columns: repeat(6, 1fr);
+  gap: 6px;
+  margin-bottom: 16px;
+}
+.itinerary-day-tab {
+  min-height: 52px;
+  border: 1px solid var(--mwt-border);
+  border-radius: var(--radius);
+  background: #fff;
+  font-weight: 700;
+  font-size: 13px;
+  cursor: pointer;
+}
+.itinerary-day-tab.active {
+  background: var(--mwt-red);
+  color: #fff;
+  border-color: var(--mwt-red);
+}
+
+.itinerary-time-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px;
+  margin-bottom: 10px;
+}
+.itinerary-time-field {
+  flex: 1 1 160px;
+  display: block;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--mwt-navy);
+}
+.itinerary-time-field input {
+  display: block;
+  width: 100%;
+  min-height: 48px;
+  padding: 10px 12px;
+  margin-top: 6px;
+  border: 1px solid var(--mwt-border);
+  border-radius: var(--radius);
+  font-size: 16px;
+}
+
+.itinerary-hours-display {
+  font-weight: 700;
+  color: var(--mwt-navy);
+  margin: 4px 0 10px;
+}
+.itinerary-error {
+  color: var(--mwt-red-dark);
+  font-weight: 600;
+  font-size: 13.5px;
+  margin: 4px 0 10px;
+}
+
+.itinerary-jobs-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.itinerary-job-row {
+  display: grid;
+  grid-template-columns: 1.3fr 1.2fr 1.3fr auto;
+  gap: 8px;
+  align-items: center;
+}
+.itinerary-job-row input,
+.itinerary-job-row select {
+  min-height: 46px;
+  padding: 8px 10px;
+  border: 1px solid var(--mwt-border);
+  border-radius: var(--radius);
+  font-size: 15px;
+  width: 100%;
+}
+.itinerary-job-remove {
+  min-width: 40px;
+  min-height: 40px;
+  border: none;
+  background: none;
+  color: var(--mwt-red);
+  font-size: 16px;
+  cursor: pointer;
+  border-radius: var(--radius);
+}
+.itinerary-job-remove:hover { background: #fdecea; }
+
+.itinerary-mileage-grid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 12px;
+}
+.itinerary-field {
+  display: block;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--mwt-navy);
+}
+.itinerary-field input {
+  display: block;
+  width: 100%;
+  min-height: 46px;
+  padding: 10px 12px;
+  margin-top: 6px;
+  border: 1px solid var(--mwt-border);
+  border-radius: var(--radius);
+  font-size: 16px;
+}
+.itinerary-field-static { display: flex; align-items: flex-end; }
+
+.itinerary-summary { background: #f8f9fb; }
+.itinerary-summary-grid { display: flex; flex-direction: column; }
+.itinerary-summary-row {
+  display: flex;
+  justify-content: space-between;
+  padding: 9px 2px;
+  border-bottom: 1px solid var(--mwt-border);
+  font-size: 14.5px;
+}
+.itinerary-summary-row:last-child {
+  border-bottom: none;
+  font-weight: 700;
+  color: var(--mwt-navy);
+  font-size: 16px;
+  padding-top: 12px;
+}
+.itinerary-summary-label { color: var(--mwt-muted); }
+.itinerary-summary-row:last-child .itinerary-summary-label { color: var(--mwt-navy); }
+
+.itinerary-choose-week { min-width: 260px; }
+.itinerary-week-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 14px;
+  max-height: 300px;
+  overflow-y: auto;
+}
+.itinerary-week-option { text-align: center; }
+
+/* Admin: Submitted Jobs / Weekly Itineraries tab bar */
+.admin-tab-bar {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 18px;
+  border-bottom: 1px solid var(--mwt-border);
+}
+.admin-tab-btn {
+  padding: 10px 18px;
+  min-height: 44px;
+  border: none;
+  background: none;
+  font-weight: 700;
+  font-size: 14.5px;
+  color: var(--mwt-muted);
+  cursor: pointer;
+  border-bottom: 3px solid transparent;
+}
+.admin-tab-btn.active {
+  color: var(--mwt-navy);
+  border-bottom-color: var(--mwt-red);
+}
+
+@media (max-width: 640px) {
+  .itinerary-day-tabs { grid-template-columns: repeat(3, 1fr); grid-template-rows: repeat(2, 1fr); }
+  .itinerary-job-row { grid-template-columns: 1fr; }
+  .itinerary-mileage-grid { grid-template-columns: 1fr; }
 }
