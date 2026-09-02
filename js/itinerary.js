@@ -1168,29 +1168,13 @@ async function renderItineraryAdminSection(resultsBox, filterBar) {
     ]));
   }
 
-  async function viewItineraryPdf(row) {
-    if (!navigator.onLine) { toast("No internet connection. Connect to view the PDF.", "error"); return; }
-    toast("Loading PDF\u2026");
-    try {
-      const resp = await fetch(MWT_CONFIG.submitApiUrl, {
-        method: "POST",
-        headers: { "Content-Type": "text/plain;charset=utf-8" },
-        body: JSON.stringify({ action: "getItineraryPdf", adminToken: getAdminToken(), submissionId: row.submissionId })
-      });
-      let payload = null;
-      try { payload = await resp.json(); } catch (e) { /* handled below */ }
-      if (!resp.ok || !payload || !payload.success) {
-        toast((payload && payload.error) ? payload.error : "Could not load that PDF.", "error");
-        return;
-      }
-      const byteChars = atob(payload.pdfBase64);
-      const bytes = new Uint8Array(byteChars.length);
-      for (let i = 0; i < byteChars.length; i++) bytes[i] = byteChars.charCodeAt(i);
-      const blob = new Blob([bytes], { type: "application/pdf" });
-      await showPdfDocument(blob, { title: "Weekly Itinerary \u2014 " + (row.installerName || "") });
-    } catch (err) {
-      toast("Could not reach the server. Check your connection and try again.", "error");
-    }
+  function viewItineraryPdf(row) {
+    // Opens the low-memory single-page Admin viewer immediately (before
+    // the network request even starts) - see showAdminPdfDocument() in
+    // app.js, shared with the regular Submitted Jobs admin view.
+    showAdminPdfDocument("getItineraryPdf", getAdminToken(), row.submissionId, {
+      title: "Weekly Itinerary \u2014 " + (row.installerName || "")
+    });
   }
 
   // Admin-only - this whole section is only ever reached once already
