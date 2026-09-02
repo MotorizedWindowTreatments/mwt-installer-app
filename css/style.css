@@ -52,6 +52,50 @@ button, input, select, textarea {
   display: flex;
   flex-direction: column;
   transition: transform 0.2s ease;
+  /* Bounds the sidebar to the visible viewport height at every size
+     (not only inside the mobile drawer breakpoint below), so
+     .sidebar-scroll's flex:1 + overflow-y:auto actually has a definite
+     box to scroll within and .sidebar-footer (Account/Log Out) always
+     stays pinned in view - including wider iPad-landscape/desktop
+     widths, which previously relied on scrolling the entire page to
+     reach a long sidebar's lower content. position:sticky keeps this
+     purely a scroll-behavior change: the sidebar's initial appearance
+     and layout on desktop are unaffected, it just no longer scrolls
+     away with the rest of the page. The mobile media query below
+     overrides this with position:fixed (a full-screen overlay drawer),
+     which is the correct treatment for narrow phone widths.
+     100dvh falls back gracefully to 100vh on any browser that doesn't
+     recognize dvh. */
+  height: 100vh;
+  height: 100dvh;
+  position: sticky;
+  top: 0;
+}
+
+/* The scrollable middle region (New Job / Saved Jobs / Weekly
+   Itineraries / Backup) - flex:1 + min-height:0 is what actually lets
+   this area shrink and scroll independently instead of forcing #sidebar
+   itself to grow to fit all content, which is what previously pushed
+   the Account/Log Out footer below (off) the visible viewport on
+   smaller phones once there was enough sidebar content. Account/Log
+   Out itself lives in the separate, non-scrolling .sidebar-footer
+   below, so it is never part of this scrolling region and can never be
+   scrolled out of reach.
+   Same rule for desktop/iPad: harmless there today (the sidebar isn't
+   height-constrained outside the mobile breakpoint, so this scroll
+   region simply never needs to engage), but keeps behavior correct if
+   that ever changes. */
+.sidebar-scroll {
+  flex: 1 1 auto;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  min-height: 0;
+}
+
+.sidebar-footer {
+  flex-shrink: 0;
+  border-top: 1px solid rgba(255,255,255,0.12);
+  padding: 8px 12px calc(10px + env(safe-area-inset-bottom, 0px));
 }
 
 #sidebar .brand {
@@ -674,6 +718,34 @@ body.pdf-viewer-open {
   overflow: hidden;
 }
 
+/* Prev/Next page bar for the Admin single-page PDF viewer
+   (showAdminPdfDocument) - not used by the Installer Preview PDF
+   viewer, which still shows every page stacked in .pdf-page-list. */
+.pdf-page-nav {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 14px;
+  padding-bottom: calc(10px + env(safe-area-inset-bottom, 0px));
+  background: var(--mwt-navy);
+  color: #fff;
+}
+.pdf-page-nav .btn {
+  color: #fff;
+  border-color: rgba(255, 255, 255, 0.35);
+}
+.pdf-page-nav .btn:disabled {
+  opacity: 0.4;
+}
+.pdf-page-label {
+  font-size: 14px;
+  font-weight: 600;
+  flex: 1;
+  text-align: center;
+}
+
 /* ---------------- Toast ---------------- */
 
 #toast-host {
@@ -876,7 +948,8 @@ body.pdf-viewer-open {
 @media (max-width: 900px) {
   #sidebar {
     position: fixed;
-    left: 0; top: 0; bottom: 0;
+    left: 0; top: 0;
+    height: 100dvh;
     transform: translateX(-100%);
     z-index: 40;
     width: 82vw;
