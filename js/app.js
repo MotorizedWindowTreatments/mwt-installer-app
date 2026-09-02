@@ -313,7 +313,18 @@ function renderSidebar() {
   nav.appendChild(savedGroup);
   nav.appendChild(itineraryGroup);
   nav.appendChild(renderBackupGroup());
-  nav.appendChild(renderAccountGroup());
+
+  // Account/Log Out renders into the dedicated, always-visible sidebar
+  // footer (see index.html #sidebar-footer + .sidebar-footer CSS) -
+  // NOT into the scrolling nav above. This is the actual fix for Log
+  // Out being pushed out of reach on smaller iPhones: the footer never
+  // scrolls away, regardless of how much content (many Saved Jobs,
+  // etc.) is above it in the scrollable region.
+  const footer = document.getElementById("sidebar-footer");
+  if (footer) {
+    footer.innerHTML = "";
+    footer.appendChild(renderAccountGroup());
+  }
 
   renderSidebarJobList();
 }
@@ -1004,14 +1015,33 @@ function renderAttachments(job) {
       const files = Array.from(e.target.files || []);
       for (const file of files) {
         try {
-          const dataUrl = await fileToDataUrl(file);
-          job.attachments.push({
-            id: uid(),
-            name: file.name,
-            type: file.type,
-            size: file.size,
-            dataUrl
-          });
+          // Images get the same compression already used for per-line
+          // photos (matches compressImageFile's own JPEG output/size
+          // accounting exactly) - non-image attachments (PDF, MOV, MP4,
+          // etc.) are read as-is, completely unchanged. This only
+          // affects NEW uploads; any already-saved job's existing
+          // attachments keep whatever bytes they already have and
+          // continue to render exactly as before.
+          const isImage = file.type && file.type.startsWith("image/");
+          if (isImage) {
+            const dataUrl = await compressImageFile(file);
+            job.attachments.push({
+              id: uid(),
+              name: file.name,
+              type: "image/jpeg",
+              size: Math.round(dataUrl.length * 0.75),
+              dataUrl
+            });
+          } else {
+            const dataUrl = await fileToDataUrl(file);
+            job.attachments.push({
+              id: uid(),
+              name: file.name,
+              type: file.type,
+              size: file.size,
+              dataUrl
+            });
+          }
         } catch (err) {
           toast("Could not read " + file.name + ": " + err.message, "error");
         }
@@ -1310,6 +1340,15 @@ function loadPdfJs() {
     _pdfjsLibPromise = import(pdfjsAssetUrl("pdf.min.mjs")).then((lib) => {
       lib.GlobalWorkerOptions.workerSrc = pdfjsAssetUrl("pdf.worker.min.mjs");
       return lib;
+    }).catch((err) => {
+      // Do NOT permanently cache a rejected promise here - a transient
+      // failure loading the PDF.js module itself (e.g. a flaky network
+      // blip on first use) would otherwise silently break every later
+      // PDF view for the rest of the session, with no way to recover
+      // short of a full page reload. Resetting to null lets the very
+      // next call try importing again from scratch.
+      _pdfjsLibPromise = null;
+      throw err;
     });
   }
   return _pdfjsLibPromise;
@@ -1410,6 +1449,357 @@ async function previewPdf(job, schema) {
   } catch (err) {
     console.error(err);
     toast("Could not generate the PDF preview: " + err.message, "error");
+  }
+}
+
+// ---------------------------------------------------------------
+// Admin PDF viewer - a separate, lower-memory path from
+// showPdfDocument() above (used only by Installer Preview PDF, which
+// is deliberately left unchanged). Used by BOTH Administrator
+// "Submitted Jobs" View PDF and "Weekly Itineraries" View PDF.
+//
+// Differences from the Installer viewer, all specifically to address
+// real production instability reports on iPhone with large photo PDFs:
+//   - the viewer overlay opens IMMEDIATELY on tap, before the network
+//     request even starts, so there is never a moment where nothing
+//     visibly happens after tapping View PDF;
+//   - only ONE page is ever rendered/kept in memory at a time (Prev/
+//     Next reuse the same canvas) instead of rendering and retaining
+//     every page's canvas simultaneously;
+//   - the fetched bytes are handed to PDF.js directly as a Uint8Array,
+//     skipping the extra Blob + second ArrayBuffer copy the old path
+//     made, and the base64 string is dropped as soon as it's decoded;
+//   - errors are distinguished (auth / not found / backend / invalid
+//     response / timeout / network) with a small bounded retry (never
+//     unbounded) for the transient categories only.
+// ---------------------------------------------------------------
+
+function pdfSleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// Decodes a base64 string into a Uint8Array without ever materializing
+// one full-size intermediate binary string for the whole file at once
+// (which is what plain atob(base64) on the entire string does). Instead
+// this decodes CHUNK_BASE64_CHARS worth of base64 at a time - each
+// chunk only ever produces a small, short-lived binary string that's
+// immediately copied into the pre-sized target array and then eligible
+// for garbage collection, rather than one large decoded string living
+// alongside both the original base64 string and the final Uint8Array
+// for the whole file's duration. No external library - just atob().
+// CHUNK_BASE64_CHARS is a multiple of 4 (base64's own atomic group
+// size), so every chunk - including the final, possibly-shorter one -
+// is itself always a valid, independently-decodable base64 segment.
+const CHUNK_BASE64_CHARS = 32768;
+function base64ToUint8ArrayChunked(base64) {
+  const totalChars = base64.length;
+  let padding = 0;
+  if (base64.endsWith("==")) padding = 2;
+  else if (base64.endsWith("=")) padding = 1;
+  const totalBytes = Math.floor(totalChars / 4) * 3 - padding;
+
+  const bytes = new Uint8Array(totalBytes);
+  let bytesWritten = 0;
+  for (let charIndex = 0; charIndex < totalChars; charIndex += CHUNK_BASE64_CHARS) {
+    const chunk = base64.slice(charIndex, charIndex + CHUNK_BASE64_CHARS);
+    const decodedChunk = atob(chunk);
+    for (let i = 0; i < decodedChunk.length; i++) {
+      bytes[bytesWritten++] = decodedChunk.charCodeAt(i);
+    }
+  }
+  return bytes;
+}
+
+class PdfLoadError extends Error {
+  constructor(kind, message) {
+    super(message);
+    this.kind = kind; // "auth" | "notfound" | "backend" | "invalid" | "timeout" | "network"
+  }
+}
+
+// Fetches and decodes one archived PDF's bytes for the Admin viewer.
+// `action` is "getSubmissionPdf" or "getItineraryPdf" - both already
+// require a valid Admin token server-side; this function does not
+// change that, only how the response is fetched/decoded/retried.
+async function fetchAdminPdfBytes(action, adminToken, submissionId) {
+  const maxAttempts = 3; // bounded - 1 try + up to 2 retries, never unbounded
+  let lastMessage = "Could not load the PDF.";
+  let lastKind = "network";
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 25000);
+    try {
+      const resp = await fetch(MWT_CONFIG.submitApiUrl, {
+        method: "POST",
+        headers: { "Content-Type": "text/plain;charset=utf-8" },
+        body: JSON.stringify({ action, adminToken, submissionId }),
+        signal: controller.signal
+      });
+      clearTimeout(timeoutId);
+
+      if (!resp.ok) {
+        lastKind = "backend";
+        lastMessage = "The server had a problem (status " + resp.status + ").";
+        if (attempt < maxAttempts) { await pdfSleep(attempt * 700); continue; }
+        throw new PdfLoadError(lastKind, lastMessage);
+      }
+
+      let rawText;
+      let payload;
+      try {
+        rawText = await resp.text();
+        payload = JSON.parse(rawText);
+      } catch (parseErr) {
+        // Invalid/truncated response - genuinely worth one retry (could
+        // be a transient blip), but not looped forever.
+        lastKind = "invalid";
+        lastMessage = "The server's response could not be read (it may have been cut off).";
+        if (attempt < maxAttempts) { await pdfSleep(attempt * 700); continue; }
+        throw new PdfLoadError(lastKind, lastMessage);
+      } finally {
+        rawText = null; // release ASAP, no need to hold the raw text once parsed
+      }
+
+      if (!payload.success) {
+        const msg = String(payload.error || "").toLowerCase();
+        if (msg.indexOf("not authorized") !== -1) {
+          // Permanent for this session - retrying won't help.
+          throw new PdfLoadError("auth", payload.error || "Not authorized.");
+        }
+        if (msg.indexOf("could not be found") !== -1 || msg.indexOf("not found") !== -1) {
+          // Permanent - the record/file genuinely isn't there.
+          throw new PdfLoadError("notfound", payload.error || "That PDF could not be found.");
+        }
+        lastKind = "backend";
+        lastMessage = payload.error || "The server reported an error.";
+        if (attempt < maxAttempts) { await pdfSleep(attempt * 700); continue; }
+        throw new PdfLoadError(lastKind, lastMessage);
+      }
+
+      let base64 = payload.pdfBase64;
+      const filename = payload.filename;
+      payload.pdfBase64 = null; // release the JSON payload's own copy immediately
+      payload = null;
+      if (!base64) {
+        throw new PdfLoadError("invalid", "The server did not return any PDF data.");
+      }
+      const bytes = base64ToUint8ArrayChunked(base64);
+      base64 = null; // release the base64 string as soon as it's decoded
+      return { bytes, filename };
+    } catch (err) {
+      clearTimeout(timeoutId);
+      if (err instanceof PdfLoadError) throw err;
+      if (err && err.name === "AbortError") {
+        lastKind = "timeout";
+        lastMessage = "The request timed out. Check your connection and try again.";
+        if (attempt < maxAttempts) { await pdfSleep(attempt * 700); continue; }
+        throw new PdfLoadError(lastKind, lastMessage);
+      }
+      lastKind = "network";
+      lastMessage = "Could not reach the server. Check your connection and try again.";
+      if (attempt < maxAttempts) { await pdfSleep(attempt * 700); continue; }
+      throw new PdfLoadError(lastKind, lastMessage);
+    }
+  }
+  throw new PdfLoadError(lastKind, lastMessage);
+}
+
+function pdfLoadErrorMessage(err) {
+  const kind = err && err.kind;
+  if (kind === "auth") return "You're not authorized to view this PDF. Please log in again.";
+  if (kind === "notfound") return "That PDF could not be found. It may have been deleted.";
+  if (kind === "timeout") return "The request timed out. Check your connection and try again.";
+  if (kind === "invalid") return "The server's response could not be read. Please try again.";
+  if (kind === "network") return "Could not reach the server. Check your connection and try again.";
+  if (kind === "backend") return err.message || "The server reported an error.";
+  return "Could not display the PDF" + (err && err.message ? ": " + err.message : ".");
+}
+
+// The Admin single-page viewer itself - opens immediately, fetches in
+// the background, renders one page at a time.
+async function showAdminPdfDocument(action, adminToken, submissionId, opts) {
+  opts = opts || {};
+  const title = opts.title || "PDF";
+
+  const overlay = el("div", { class: "pdf-viewer-overlay" });
+  const closeBtn = el("button", { class: "btn btn-outline pdf-viewer-close" }, "Close");
+  const bar = el("div", { class: "pdf-viewer-bar" }, [
+    el("div", { class: "pdf-viewer-title" }, title),
+    closeBtn
+  ]);
+  const statusArea = el("div", { class: "help-text", style: "padding:30px;text-align:center;color:#fff;" }, "Loading PDF\u2026");
+  const canvas = el("canvas", { class: "pdf-page-canvas", style: "display:none;" });
+  const pageArea = el("div", { class: "pdf-page-list" }, [statusArea, canvas]);
+
+  const prevBtn = el("button", { class: "btn btn-outline" }, "\u2039 Previous");
+  const pageLabel = el("div", { class: "pdf-page-label" }, "");
+  const nextBtn = el("button", { class: "btn btn-outline" }, "Next \u203A");
+  const navBar = el("div", { class: "pdf-page-nav", style: "display:none;" }, [prevBtn, pageLabel, nextBtn]);
+
+  overlay.appendChild(bar);
+  overlay.appendChild(pageArea);
+  overlay.appendChild(navBar);
+  document.body.appendChild(overlay);
+  document.body.classList.add("pdf-viewer-open");
+
+  let pdfDoc = null;
+  let currentPage = 1;
+  let closed = false;
+  // Safe rendering lock: true for the entire span from "a render just
+  // started" to "that render (or its cleanup/error handling) finished" -
+  // this is what actually stops a rapid double-tap on Previous/Next
+  // from starting a second PDF.js page.render() against the same
+  // canvas while the first one is still in flight. currentRenderTask
+  // holds the in-flight PDF.js RenderTask (if any) so it can be
+  // cancelled cleanly if the viewer is closed mid-render, rather than
+  // leaving that render's promise to reject with nobody handling it.
+  let isRendering = false;
+  let currentRenderTask = null;
+
+  // Only ONE canvas exists for the whole life of this viewer - changing
+  // pages clears and redraws it rather than creating a new one, so
+  // memory use never grows with page count the way the old "render
+  // every page and keep every canvas" approach did.
+  function cleanup() {
+    closed = true;
+    if (currentRenderTask) {
+      // Cancel BEFORE resetting canvas dimensions below - PDF.js's
+      // cancel() makes its .promise reject with a
+      // RenderingCancelledException, which renderPage()'s own
+      // try/catch already handles, so this never surfaces as an
+      // unhandled rejected render promise. Cancelling first (rather
+      // than just letting it run to completion into a canvas that's
+      // about to be zeroed out) also avoids drawing into a canvas
+      // whose dimensions are changing underneath it.
+      try { currentRenderTask.cancel(); } catch (e) { /* ignore */ }
+      currentRenderTask = null;
+    }
+    const ctx = canvas.getContext("2d");
+    if (ctx) ctx.clearRect(0, 0, canvas.width, canvas.height);
+    canvas.width = 0;
+    canvas.height = 0;
+    if (pdfDoc) {
+      try { pdfDoc.destroy(); } catch (e) { /* ignore */ }
+      pdfDoc = null;
+    }
+    overlay.remove();
+    document.body.classList.remove("pdf-viewer-open");
+  }
+  closeBtn.addEventListener("click", cleanup);
+
+  function showError(message) {
+    statusArea.style.display = "";
+    statusArea.textContent = message;
+    canvas.style.display = "none";
+    navBar.style.display = "none";
+  }
+
+  // Previous/Next are disabled for the ENTIRE duration a render is in
+  // flight (not just at page boundaries), which is what actually makes
+  // overlapping renders impossible from the UI - a disabled button
+  // does not fire click events at all, so a rapid double-tap's second
+  // tap simply does nothing rather than queuing another render.
+  function updateNavButtons() {
+    if (isRendering) {
+      prevBtn.disabled = true;
+      nextBtn.disabled = true;
+      return;
+    }
+    prevBtn.disabled = currentPage <= 1;
+    nextBtn.disabled = !pdfDoc || currentPage >= pdfDoc.numPages;
+  }
+
+  async function renderPage(pageNum) {
+    if (!pdfDoc || closed) return;
+    // Re-entry guard - the actual lock. Even though the buttons are
+    // disabled while isRendering is true (the normal way this would be
+    // reached), this keeps renderPage() itself safe against ever being
+    // called again before the current render has fully finished,
+    // regardless of what triggers the call.
+    if (isRendering) return;
+    isRendering = true;
+    updateNavButtons();
+
+    let page = null;
+    try {
+      page = await pdfDoc.getPage(pageNum);
+      if (closed) return;
+      const containerWidth = Math.max(Math.min(overlay.clientWidth || window.innerWidth, 900) - 24, 280);
+      const pixelRatio = Math.min(window.devicePixelRatio || 1, 2);
+      const baseViewport = page.getViewport({ scale: 1 });
+      const fitScale = containerWidth / baseViewport.width;
+      const displayViewport = page.getViewport({ scale: fitScale });
+      const renderViewport = page.getViewport({ scale: fitScale * pixelRatio });
+
+      canvas.width = Math.round(renderViewport.width);
+      canvas.height = Math.round(renderViewport.height);
+      canvas.style.width = Math.round(displayViewport.width) + "px";
+      canvas.style.height = Math.round(displayViewport.height) + "px";
+
+      const ctx = canvas.getContext("2d");
+      const renderTask = page.render({ canvasContext: ctx, viewport: renderViewport });
+      currentRenderTask = renderTask;
+      await renderTask.promise;
+      currentRenderTask = null;
+      if (closed) return;
+      pageLabel.textContent = "Page " + pageNum + " of " + pdfDoc.numPages;
+    } catch (err) {
+      currentRenderTask = null;
+      // A render cancelled by cleanup() during teardown rejects with a
+      // RenderingCancelledException - closed is set to true BEFORE that
+      // cancel() is ever called, so checking closed here reliably tells
+      // the two apart: expected/harmless cancellation (silent) versus a
+      // REAL rendering failure while the viewer is still open, which
+      // must never be swallowed - it's surfaced with the same
+      // showError() used for load failures, so the admin is never left
+      // looking at a blank/stale canvas with no explanation.
+      if (!closed) {
+        console.error(err);
+        showError("Could not display this page. Please try again.");
+      }
+    } finally {
+      // Runs whether the render succeeded, failed, or was cancelled -
+      // as long as a page object was actually obtained, its resources
+      // are released either way, not only on the success path.
+      if (page) {
+        try { page.cleanup(); } catch (e) { /* ignore */ }
+      }
+      isRendering = false;
+      if (!closed) updateNavButtons();
+    }
+  }
+
+  prevBtn.addEventListener("click", () => {
+    if (isRendering || !pdfDoc || currentPage <= 1) return;
+    currentPage--;
+    renderPage(currentPage);
+  });
+  nextBtn.addEventListener("click", () => {
+    if (isRendering || !pdfDoc || currentPage >= pdfDoc.numPages) return;
+    currentPage++;
+    renderPage(currentPage);
+  });
+
+  try {
+    const [pdfjsLib, fetched] = await Promise.all([
+      loadPdfJs(),
+      fetchAdminPdfBytes(action, adminToken, submissionId)
+    ]);
+    if (closed) return; // admin closed the viewer while this was still loading
+
+    const loadingTask = pdfjsLib.getDocument({ data: fetched.bytes });
+    pdfDoc = await loadingTask.promise;
+    if (closed) { try { pdfDoc.destroy(); } catch (e) { /* ignore */ } return; }
+
+    statusArea.style.display = "none";
+    canvas.style.display = "";
+    navBar.style.display = "flex";
+    currentPage = 1;
+    await renderPage(currentPage);
+  } catch (err) {
+    console.error(err);
+    if (!closed) showError(pdfLoadErrorMessage(err));
   }
 }
 
@@ -2017,35 +2407,12 @@ async function renderAdminDashboard() {
     box.appendChild(pager);
   }
 
-  async function viewSubmittedPdf(row) {
-    if (!navigator.onLine) {
-      toast("No internet connection. Connect to view the PDF.", "error");
-      return;
-    }
-    toast("Loading PDF\u2026");
-    try {
-      const resp = await fetch(MWT_CONFIG.submitApiUrl, {
-        method: "POST",
-        headers: { "Content-Type": "text/plain;charset=utf-8" },
-        body: JSON.stringify({ action: "getSubmissionPdf", adminToken: getAdminToken(), submissionId: row.submissionId })
-      });
-      let payload = null;
-      try { payload = await resp.json(); } catch (e) { /* handled below */ }
-      if (!resp.ok || !payload || !payload.success) {
-        toast((payload && payload.error) ? payload.error : "Could not load that PDF.", "error");
-        return;
-      }
-      const byteChars = atob(payload.pdfBase64);
-      const bytes = new Uint8Array(byteChars.length);
-      for (let i = 0; i < byteChars.length; i++) bytes[i] = byteChars.charCodeAt(i);
-      const blob = new Blob([bytes], { type: "application/pdf" });
-      await showPdfDocument(blob, {
-        title: "Submitted PDF \u2014 " + (row.designFirm || "") + " \u2013 " + (row.sidemark || ""),
-        filename: payload.filename || row.pdfFilename || (row.submissionId + ".pdf")
-      });
-    } catch (err) {
-      toast("Could not reach the server. Check your connection and try again.", "error");
-    }
+  function viewSubmittedPdf(row) {
+    // Opens the low-memory single-page Admin viewer immediately (before
+    // the network request even starts) - see showAdminPdfDocument().
+    showAdminPdfDocument("getSubmissionPdf", getAdminToken(), row.submissionId, {
+      title: "Submitted PDF \u2014 " + (row.designFirm || "") + " \u2013 " + (row.sidemark || "")
+    });
   }
 
   // Admin-only, same safety pattern as the existing Weekly Itinerary
