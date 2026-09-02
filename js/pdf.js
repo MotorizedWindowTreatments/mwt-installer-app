@@ -366,6 +366,51 @@ function buildJobPdfBlob(job, schema) {
     }
   }
 
+  // ATTACHED JOB PHOTOS - actual images from the general job-level
+  // attachments (the "Photos / Files Attached to This Job" list above
+  // is text-only by design; this is where any IMAGE among those
+  // attachments is actually rendered visually, exactly once). Placed
+  // here, after Project Photos and all normal form content, on its own
+  // fresh page so it can never overlap Motorization Control Devices,
+  // notes, tables, or the per-line Project Photos section above.
+  // PDFs/MOV/MP4/other non-image attachments are never embedded here -
+  // they remain listed as text only, exactly as before.
+  const attachmentImages = (job.attachments || []).filter((a) => a.type && a.type.startsWith("image/"));
+  if (attachmentImages.length) {
+    doc.addPage(wide ? "landscape" : "portrait");
+    y = 40;
+    doc.setFont("helvetica", "bold");
+    doc.setFontSize(13);
+    doc.text("ATTACHED JOB PHOTOS", marginX, y);
+    y += 20;
+
+    const thumbW = wide ? 220 : 170;
+    const thumbH = wide ? 165 : 130;
+    const gap = 14;
+    let x = marginX;
+
+    attachmentImages.forEach((a) => {
+      if (x + thumbW > pageWidth - marginX) { x = marginX; y += thumbH + 22; }
+      if (y + thumbH + 22 > pageHeight - 30) { doc.addPage(wide ? "landscape" : "portrait"); y = 40; x = marginX; }
+      try {
+        doc.addImage(a.dataUrl, undefined, x, y, thumbW, thumbH, undefined, "FAST");
+      } catch (e) {
+        doc.rect(x, y, thumbW, thumbH);
+        doc.setFontSize(8);
+        doc.text("Could not preview", x + 8, y + thumbH / 2);
+      }
+      // Filename caption directly under each thumbnail, where practical
+      // (truncated to fit the thumbnail's own width so it never runs
+      // into the next photo).
+      doc.setFont("helvetica", "normal");
+      doc.setFontSize(7.5);
+      const captionLines = doc.splitTextToSize(a.name || "", thumbW);
+      doc.text(captionLines[0] || "", x, y + thumbH + 10);
+      x += thumbW + gap;
+    });
+    y += thumbH + 28;
+  }
+
   // Footer note + page numbers on every page
   const pageCount = doc.internal.getNumberOfPages();
   for (let i = 1; i <= pageCount; i++) {
