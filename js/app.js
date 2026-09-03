@@ -617,6 +617,12 @@ async function duplicateJob(id) {
   // original - it must get its own submissionId so it can never be
   // treated as "already processed" by the backend's idempotency check.
   copy.submissionId = uid();
+  // A duplicate must never inherit a lingering pending-resend id from
+  // the original (e.g. if the original had a failed resend attempt in
+  // progress) - it's an unrelated future submission with its own fresh
+  // submissionId above, so any pending-resend state from the original
+  // has no meaning here.
+  copy.pendingResubmissionId = null;
   copy.manualName = (orig.manualName || computeDisplayName(orig)) + " (copy)";
   await MwtDB.saveJob(copy);
   await refreshJobsCache();
@@ -1831,6 +1837,35 @@ function confirmSubmit(job, schema) {
     return;
   }
 
+  // A job whose status is already "submitted" needs an explicit,
+  // clearly-worded confirmation before an intentional resend - shown
+  // before the Designer-Email-missing check / "Submit this project?"
+  // confirmation below, which still run exactly as they always have
+  // (same condition, same wording) once the resend itself is confirmed,
+  // via confirmSubmitAfterResendGate() - so first-time submission
+  // behavior, and the Designer Email check itself, are both completely
+  // unchanged by this.
+  if (job.status === "submitted") {
+    openModal({
+      title: "This job has already been submitted.",
+      body: "Do you want to send an updated version? This will generate a new PDF and email the job again.",
+      confirmLabel: "Resend Updated Job",
+      confirmClass: "btn-primary",
+      onConfirm: () => confirmSubmitAfterResendGate(job, schema, designerEmail)
+    });
+    return;
+  }
+
+  confirmSubmitAfterResendGate(job, schema, designerEmail);
+}
+
+// Exactly today's existing Designer-Email-missing / "Submit this
+// project?" logic, unchanged - shared by both the first-time path
+// (called directly from confirmSubmit above) and the resend path
+// (called after the resend confirmation above), so a resend still gets
+// the same designer-email safety check a first-time submission does,
+// without changing that check's own condition or wording at all.
+function confirmSubmitAfterResendGate(job, schema, designerEmail) {
   if (!designerEmail) {
     openModal({
       title: "Designer email is missing.",
@@ -1840,6 +1875,14 @@ function confirmSubmit(job, schema) {
       cancelLabel: "Go Back",
       onConfirm: () => doSubmit(job, schema)
     });
+    return;
+  }
+
+  if (job.status === "submitted") {
+    // Already confirmed via the resend gate in confirmSubmit() above -
+    // proceed directly, no redundant second "confirm before sending"
+    // modal on top of that one.
+    doSubmit(job, schema);
     return;
   }
 
@@ -1853,11 +1896,38 @@ function confirmSubmit(job, schema) {
 }
 
 async function doSubmit(job, schema) {
+  // Intentional resend of an already-submitted job: reuse a pending
+  // resend id if one is already in progress (e.g. a previous attempt
+  // that failed, timed out, or had its response lost, now being
+  // retried), otherwise mint a fresh one now - BEFORE persisting or
+  // making the network call - so a retry after a lost/failed request
+  // reuses the exact same id instead of minting a second one and
+  // risking two separate "successful" emails for what the installer
+  // intends as a single resend. The backend's own alreadyProcessed
+  // protection (keyed on this id, unchanged in Code.gs) is what
+  // actually prevents the duplicate email on retry - this is what
+  // makes that protection work correctly for resends too, without
+  // weakening it for anything else.
+  const isResend = job.status === "submitted";
+  if (isResend && !job.pendingResubmissionId) {
+    job.pendingResubmissionId = uid();
+  }
+
   await persistJob(job, { silent: true });
 
   if (!navigator.onLine) {
-    job.status = "ready";
-    await persistJob(job, { silent: true });
+    // For a job that has never been submitted, "ready" correctly means
+    // "queued, nothing has ever gone out yet" - unchanged. For a
+    // RESEND, the job's previous submission is genuinely still
+    // submitted; being offline right now only means this particular
+    // resend attempt hasn't gone out yet, so status must stay
+    // "submitted" rather than being overwritten to "ready". The
+    // pending resend id above is already persisted either way, so the
+    // next online attempt picks up exactly where this one left off.
+    if (!isResend) {
+      job.status = "ready";
+      await persistJob(job, { silent: true });
+    }
     toast("No internet connection. Your project is saved. Please submit when a connection is available.", "error");
     render();
     return;
@@ -1871,13 +1941,21 @@ async function doSubmit(job, schema) {
   // built directly from the entered field values - NOT the manually
   // entered Job Name, and with no form name appended. (The PDF's own
   // "Job Name" line still uses computeDisplayName() as before - this
-  // only affects the email subject.)
+  // only affects the email subject.) Unchanged for a resend - no
+  // revision number or "UPDATED" marker is added to the subject in
+  // this revision.
   const subject = buildEmailSubject(job);
   const designerEmail = getDesignerEmail(job);
 
   // Backward-compat: a job saved before this update won't have a
   // submissionId yet - generate one now rather than block submission.
   if (!job.submissionId) job.submissionId = uid();
+
+  // The id actually sent to the backend for THIS request: the pending
+  // resend id for an intentional resend, or the job's normal
+  // submissionId otherwise (first-time submission, or a plain retry of
+  // a first-time submission that has not yet succeeded).
+  const submissionIdForRequest = isResend ? job.pendingResubmissionId : job.submissionId;
 
   try {
     const base64Pdf = await blobToBase64(blob);
@@ -1897,7 +1975,7 @@ async function doSubmit(job, schema) {
     const payloadBody = JSON.stringify({
       action: "submit",
       installerToken: getDeviceToken(),
-      submissionId: job.submissionId,
+      submissionId: submissionIdForRequest,
       subject,
       filename: fileName,
       jobName,
@@ -1919,6 +1997,15 @@ async function doSubmit(job, schema) {
     try { payload = await resp.json(); } catch (parseErr) { /* non-JSON error response, handled below */ }
 
     if (resp.ok && payload && payload.success) {
+      if (isResend) {
+        // The resend is now confirmed successful - the new id becomes
+        // the job's current submissionId, and the temporary pending
+        // state is cleared only now, after that success is confirmed
+        // (never before, so a retry after any earlier failure always
+        // had the same id to reuse).
+        job.submissionId = job.pendingResubmissionId;
+        job.pendingResubmissionId = null;
+      }
       job.status = "submitted";
       job.submittedAt = nowStamp();
       job.revision = (job.revision || 0) + 1;
@@ -1929,6 +2016,9 @@ async function doSubmit(job, schema) {
       // Do NOT mark the job submitted, clear it, or claim success - the
       // email genuinely was not confirmed sent. The job stays saved so
       // the installer can simply try again once the issue is resolved.
+      // For a resend, pendingResubmissionId is deliberately left set,
+      // so that retry reuses the exact same id rather than minting a
+      // new one.
       const errMsg = (payload && payload.error) ? payload.error : ("Server returned status " + resp.status);
       console.error("Submit & Send failed:", errMsg);
       toast("Submission could not be emailed. Your job is still saved. Please try again.", "error");
