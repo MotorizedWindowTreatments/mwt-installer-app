@@ -134,17 +134,189 @@ function buildEmailSubject(job) {
 }
 
 async function refreshJobsCache() {
-  state.jobsCache = await MwtDB.getAllJobs();
+  // Lightweight - never hydrates photo Base64 data, just the fields the
+  // sidebar/Dashboard/Saved Jobs list actually need. Fine to call from
+  // less-frequent flows (initial load, Import, Duplicate, Delete); the
+  // hot path (every Save) bypasses this entirely - see updateJobInCache().
+  state.jobsCache = await MwtDB.getAllJobSummaries();
   state.jobsCache.sort((a, b) => (b.lastModified || "").localeCompare(a.lastModified || ""));
 }
 
+// Strips heavy photo dataUrl (and the internal-only _assetHydrated
+// marker) from a full, in-memory job object, producing the same
+// lightweight shape MwtDB.getAllJobSummaries() returns - used to patch
+// state.jobsCache in place after a save, without any further IndexedDB
+// read.
+function summarizeJobForCache(job) {
+  const summary = { ...job };
+  summary.lineItems = (job.lineItems || []).map((row) => {
+    if (!row.photos || !row.photos.length) return row;
+    return { ...row, photos: row.photos.map(({ dataUrl, _assetHydrated, ...rest }) => rest) };
+  });
+  if (job.attachments && job.attachments.length) {
+    summary.attachments = job.attachments.map(({ dataUrl, _assetHydrated, ...rest }) => rest);
+  }
+  return summary;
+}
+
+// Updates ONLY this one job's entry in the in-memory sidebar cache -
+// this is what replaces re-reading every full job (photos included)
+// from IndexedDB after every single save, which was the actual cause
+// of large jobs (173 lines, ~40 photos) freezing the app on Save.
+function updateJobInCache(job) {
+  const summary = summarizeJobForCache(job);
+  const idx = state.jobsCache.findIndex((j) => j.id === job.id);
+  if (idx === -1) {
+    state.jobsCache.unshift(summary);
+  } else {
+    state.jobsCache[idx] = summary;
+  }
+  state.jobsCache.sort((a, b) => (b.lastModified || "").localeCompare(a.lastModified || ""));
+}
+
+// ---------------------------------------------------------------
+// Save serialization/coalescing
+//
+// A single job's saves are never allowed to run concurrently against
+// each other - if a save is already in flight when another is
+// requested (autosave firing again, Manual Save, Submit, a fast
+// double-tap), the new request does NOT start a second overlapping
+// IndexedDB write. Instead it's coalesced into exactly ONE follow-up
+// save that runs once the current one finishes, always using
+// whatever the LATEST in-memory job state is at that moment (since the
+// job object itself is mutated in place, any reference to it already
+// reflects the newest edits by the time the follow-up actually runs).
+// This is never an unbounded queue - only ever at most one pending
+// follow-up - and every caller genuinely awaits the save that actually
+// contains their edits, never resolving early.
+//
+// This state is keyed by job.id, so saves for DIFFERENT jobs are
+// completely independent - a Job B save (e.g. the installer opening a
+// different job while Job A's save is still running) can never replace
+// or cancel Job A's own pending follow-up save. Each job tracked here
+// gets its own { inFlight, pendingArgs, pendingPromise } entry; the
+// entry is removed once that job has no in-flight or pending save left,
+// so this never grows unboundedly across a long session touching many
+// jobs.
+// ---------------------------------------------------------------
+const _saveStateByJobId = new Map();
+
+function _getSaveState(jobId) {
+  let s = _saveStateByJobId.get(jobId);
+  if (!s) {
+    s = { inFlight: null, pendingArgs: null, pendingPromise: null };
+    _saveStateByJobId.set(jobId, s);
+  }
+  return s;
+}
+
 async function persistJob(job, opts = {}) {
+  const s = _getSaveState(job.id);
+
+  if (s.inFlight) {
+    // Coalesce: remember only the LATEST job/opts as this job's one
+    // pending follow-up save (never an unbounded queue for this job),
+    // and give this caller back a promise that resolves once THAT
+    // follow-up save actually completes - shared by any other caller
+    // for this SAME job arriving during the same window, so everyone
+    // genuinely waits for the latest state to be persisted. A save for
+    // any OTHER job.id uses its own entirely separate state and is
+    // never affected by this.
+    s.pendingArgs = { job, opts };
+    if (!s.pendingPromise) {
+      s.pendingPromise = s.inFlight
+        .catch(() => { /* the CURRENT save's own failure must not block the follow-up from being attempted */ })
+        .then(() => {
+          const args = s.pendingArgs;
+          s.pendingArgs = null;
+          s.pendingPromise = null;
+          if (!args) return;
+          return persistJob(args.job, args.opts);
+        });
+    }
+    return s.pendingPromise;
+  }
+
+  s.inFlight = doPersistJobOnce(job, opts);
+  try {
+    return await s.inFlight;
+  } finally {
+    s.inFlight = null;
+    // Clean up once this job is fully idle (no in-flight, no pending
+    // follow-up) - safe here since any concurrent caller for this same
+    // job.id would already have synchronously set s.pendingArgs/
+    // s.pendingPromise before this point (see the coalescing branch
+    // above), so this check can never race past a genuinely pending
+    // follow-up.
+    if (!s.pendingArgs && !s.pendingPromise) {
+      _saveStateByJobId.delete(job.id);
+    }
+  }
+}
+
+// Per-job "edit revision" counter - every scheduleAutosave() call for a
+// job bumps its revision. An autosave/Manual Save captures the revision
+// current AT THE MOMENT it was scheduled; after its persistJob() call
+// completes, it may only touch the shared dirty flag / top-bar
+// indicator if that captured revision is STILL the latest one for that
+// job. This is what stops an OLDER save (Autosave #1) that finishes
+// AFTER a newer edit (which scheduled Autosave #2) from incorrectly
+// flipping "Unsaved changes" back to "Saved" - the newer edit's own
+// revision bump makes the older save's completion recognizably stale,
+// even though it's for the exact same job. Works alongside (not
+// instead of) the existing per-job save queue/coalescing and the
+// existing different-job protection below.
+const _editRevisionByJobId = new Map();
+
+function _bumpEditRevision(jobId) {
+  const next = (_editRevisionByJobId.get(jobId) || 0) + 1;
+  _editRevisionByJobId.set(jobId, next);
+  return next;
+}
+
+function _latestEditRevision(jobId) {
+  return _editRevisionByJobId.get(jobId) || 0;
+}
+
+async function doPersistJobOnce(job, opts) {
   job.lastModified = nowStamp();
   job.displayName = computeDisplayName(job);
-  await MwtDB.saveJob(job);
-  await refreshJobsCache();
+  // The top-bar Save indicator is shared/global UI, but a save can
+  // complete well after the installer has navigated to a DIFFERENT
+  // job (an autosave that was already awaiting IndexedDB, or this
+  // same navigation's own background flush-save). This save's
+  // completion must never visually claim THAT other, currently
+  // displayed job was saved (or failed) - only touch the indicator if
+  // the job this save is actually for is still the one on screen.
+  const isStillActiveJob = () => state.currentJob && state.currentJob.id === job.id;
+  // Additionally, even for the SAME job, this save's completion must
+  // only touch the indicator if no NEWER edit has happened since this
+  // particular save was scheduled - opts.editRevision is only passed by
+  // callers (autosave, Manual Save) that participate in this check;
+  // callers that don't pass it (Preview/Submit's own silent persists)
+  // are unaffected, preserving their existing behavior exactly.
+  const isStillLatestRevision = () => opts.editRevision === undefined || _latestEditRevision(job.id) === opts.editRevision;
+  const canUpdateSharedUi = () => isStillActiveJob() && isStillLatestRevision();
+  try {
+    await MwtDB.saveJob(job);
+  } catch (err) {
+    // Save/autosave failure: never claim Saved, never touch the
+    // in-memory job beyond the two harmless fields already set above,
+    // never navigate away or reload, never discard the current form
+    // data - the installer's edits stay exactly as they are on screen
+    // and in state.currentJob.
+    console.error("Save failed:", err);
+    if (canUpdateSharedUi()) {
+      setSaveIndicator("error");
+    }
+    if (!opts.silent) {
+      toast("This job could not be saved. Please keep this job open and do not close or refresh the app.", "error");
+    }
+    throw err;
+  }
+  updateJobInCache(job);
   renderSidebar();
-  if (!opts.silent) {
+  if (!opts.silent && canUpdateSharedUi()) {
     setSaveIndicator("saved");
   }
 }
@@ -153,11 +325,38 @@ function scheduleAutosave() {
   state.dirty = true;
   setSaveIndicator("unsaved");
   if (state.autosaveTimer) clearTimeout(state.autosaveTimer);
+  // Captures WHICH job this particular autosave belongs to, and this
+  // edit's revision number for that job. clearTimeout() above only
+  // prevents a timer that hasn't fired yet from firing - it cannot
+  // cancel an autosave whose callback has already started and is
+  // currently awaiting IndexedDB. That's true whether the installer
+  // has since navigated to a different job (handled by
+  // isStillActiveJob() above) OR made a further edit to this SAME job
+  // (handled by the revision check below) - either way, a stale
+  // completion must never clear the dirty flag out from under newer,
+  // still-unsaved work.
+  const scheduledJob = state.currentJob;
+  const scheduledRevision = _bumpEditRevision(scheduledJob.id);
   state.autosaveTimer = setTimeout(async () => {
-    if (state.currentJob) {
-      collectFormData();
-      await persistJob(state.currentJob);
-      state.dirty = false;
+    if (!scheduledJob) return;
+    collectFormData();
+    try {
+      await persistJob(scheduledJob, { editRevision: scheduledRevision });
+      // Only clear the shared dirty flag if the installer is STILL
+      // looking at this SAME job AND no newer edit (which would have
+      // bumped the revision further and scheduled its own follow-up
+      // autosave) has happened since THIS autosave was scheduled - if
+      // either isn't true, this completion is stale and must not
+      // falsely mark newer, still-unsaved edits as already saved.
+      if (state.currentJob === scheduledJob && _latestEditRevision(scheduledJob.id) === scheduledRevision) {
+        state.dirty = false;
+      }
+    } catch (err) {
+      // persistJob() already surfaced a visible error and left the
+      // save indicator in its error state (guarded the same way, via
+      // doPersistJobOnce's own canUpdateSharedUi() check above) -
+      // state.dirty intentionally stays true so nothing here pretends
+      // the save succeeded. The in-memory job is untouched either way.
     }
   }, 1200);
 }
@@ -165,13 +364,16 @@ function scheduleAutosave() {
 function setSaveIndicator(mode) {
   const indEl = document.getElementById("save-indicator");
   if (!indEl) return;
-  indEl.classList.remove("saved", "unsaved");
+  indEl.classList.remove("saved", "unsaved", "error");
   if (mode === "saved") {
     indEl.classList.add("saved");
     indEl.textContent = "Saved \u2713  \u00b7  Last saved " + new Date().toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
   } else if (mode === "unsaved") {
     indEl.classList.add("unsaved");
     indEl.textContent = "Unsaved changes\u2026";
+  } else if (mode === "error") {
+    indEl.classList.add("error");
+    indEl.textContent = "Could not save \u2013 please keep this open";
   } else {
     indEl.textContent = "";
   }
@@ -186,7 +388,11 @@ function goTo(route) {
     clearTimeout(state.autosaveTimer);
     if (state.currentJob && state.dirty) {
       collectFormData();
-      persistJob(state.currentJob, { silent: true });
+      // Fire-and-forget, matching existing navigation behavior - but
+      // guarded so a save failure here (already surfaced to the
+      // installer via setSaveIndicator/toast inside persistJob) doesn't
+      // produce an unhandled promise rejection.
+      persistJob(state.currentJob, { silent: true }).catch(() => { /* already surfaced */ });
     }
   }
   state.route = route;
@@ -203,7 +409,15 @@ async function render() {
     content.appendChild(await renderDashboard());
   } else if (state.route.type === "newJob") {
     const job = blankJob(state.route.formId);
-    await persistJob(job, { silent: true }); // save immediately so it shows in Saved Jobs right away
+    try {
+      await persistJob(job, { silent: true }); // save immediately so it shows in Saved Jobs right away
+    } catch (err) {
+      // persistJob() already surfaced a clear, visible error - still
+      // show the form below so the installer isn't stuck on a blank
+      // screen and can keep working / retry Save themselves. The job
+      // simply won't appear in Saved Jobs until a save actually
+      // succeeds.
+    }
     // Switch the route to editJob for this new job's id so that any later
     // re-render (e.g. after Submit, or Save) edits THIS job instead of
     // creating another blank one every time render() runs.
@@ -354,6 +568,13 @@ function renderBackupGroup() {
     el("button", { class: "nav-item", onclick: () => importInput.click() }, "\u2B06 Import Backup")
   );
   group.appendChild(importInput);
+  // Extra safety net specifically for big photo-heavy jobs: saves every
+  // measurement/note/field but leaves photos out entirely, so it stays
+  // small and reliable even when a job's photos are making storage
+  // tight. Does not replace the full backup above.
+  group.appendChild(
+    el("button", { class: "nav-item", onclick: exportMeasurementsBackup }, "\u{1F4CB} Emergency Measurements Backup")
+  );
   return group;
 }
 
@@ -410,6 +631,63 @@ async function exportBackup() {
   }
 }
 
+// Extra safety net specifically for a big, photo-heavy job: exports
+// every measurement/line item/field/note/motorization value and photo
+// FILENAME, but never the actual photo picture data. This is
+// deliberately lightweight - it uses getAllJobSummaries(), the same
+// path the sidebar uses, so it never touches jobAssets at all and
+// stays reliable even if photos are the thing making storage tight.
+// Does not replace the full Export Backup above.
+async function exportMeasurementsBackup() {
+  try {
+    const jobs = await MwtDB.getAllJobSummaries();
+
+    // If a job is currently open being edited, the on-screen data may
+    // be NEWER than whatever's actually persisted - this button exists
+    // specifically as the escape route for when normal Save itself is
+    // broken (e.g. 173 rows on screen, but IndexedDB only has the last
+    // successful save at 130 rows). Capture the CURRENT in-memory job
+    // directly and use it in place of (or in addition to) whatever
+    // summary IndexedDB has for it. Deliberately does NOT call
+    // persistJob() and does NOT require any save to succeed - and never
+    // navigates, reloads, or otherwise touches the open job.
+    if (state.currentJob) {
+      collectFormData();
+      const liveSnapshot = summarizeJobForCache(state.currentJob);
+      const idx = jobs.findIndex((j) => j.id === liveSnapshot.id);
+      if (idx === -1) {
+        jobs.push(liveSnapshot);
+      } else {
+        jobs[idx] = liveSnapshot;
+      }
+    }
+
+    if (!jobs.length) {
+      toast("There are no saved jobs to back up yet.");
+      return;
+    }
+    const payload = {
+      app: "MWT Installer Order Manager",
+      kind: "measurements-only",
+      appVersion: MWT_CONFIG.appVersion,
+      exportedAt: nowStamp(),
+      jobCount: jobs.length,
+      jobs
+    };
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+    const stamp = new Date().toISOString().slice(0, 16).replace(/[:T]/g, "-");
+    downloadBlob(blob, "mwt-installer-measurements-backup-" + stamp + ".json");
+    toast(
+      "Measurements backup downloaded (" + jobs.length + " job" + (jobs.length === 1 ? "" : "s") + "). " +
+      "This file does NOT include photos - it only protects your measurements, notes, and other job details.",
+      "success"
+    );
+  } catch (err) {
+    console.error(err);
+    toast("Could not create the measurements backup: " + err.message, "error");
+  }
+}
+
 async function handleImportFile(file) {
   let payload;
   try {
@@ -424,7 +702,10 @@ async function handleImportFile(file) {
     return;
   }
 
-  const existing = await MwtDB.getAllJobs();
+  // Only .id is needed here for the overlap check - the lightweight
+  // summaries path avoids hydrating every existing job's photos just to
+  // show this confirmation dialog.
+  const existing = await MwtDB.getAllJobSummaries();
   const existingIds = new Set(existing.map((j) => j.id));
   const overlapCount = payload.jobs.filter((j) => existingIds.has(j.id)).length;
 
@@ -443,6 +724,20 @@ async function handleImportFile(file) {
       let imported = 0;
       for (const job of payload.jobs) {
         if (job && job.id) {
+          // Defensive: an OLD backup (from before this internal marker
+          // was made non-enumerable) could still have _assetHydrated:
+          // true sitting as a plain, enumerable property in its JSON,
+          // which would incorrectly make saveJob() treat a photo as
+          // "already stored" and skip writing it - especially dangerous
+          // when importing onto a DIFFERENT/fresh tablet where nothing
+          // has actually been stored yet. Strip it unconditionally
+          // before saving, regardless of source, so every dataUrl in
+          // the backup is always treated as real photo data that needs
+          // to be written.
+          (job.lineItems || []).forEach((row) => {
+            (row.photos || []).forEach((p) => { if (p) delete p._assetHydrated; });
+          });
+          (job.attachments || []).forEach((a) => { if (a) delete a._assetHydrated; });
           await MwtDB.saveJob(job);
           imported++;
         }
@@ -604,7 +899,7 @@ function buildJobTable(jobs) {
 }
 
 async function duplicateJob(id) {
-  const orig = await MwtDB.getJob(id);
+  const orig = await MwtDB.getJob(id); // full, hydrated read - copy needs the actual photo data
   if (!orig) return;
   const copy = JSON.parse(JSON.stringify(orig));
   copy.id = uid();
@@ -624,6 +919,28 @@ async function duplicateJob(id) {
   // has no meaning here.
   copy.pendingResubmissionId = null;
   copy.manualName = (orig.manualName || computeDisplayName(orig)) + " (copy)";
+
+  // Every photo/attachment gets its OWN new id, and the _assetHydrated
+  // marker (copied verbatim by the JSON deep-clone above) is cleared.
+  // Without this, saveJob() would treat the copy's photos as
+  // "already-hydrated-and-unchanged" and skip writing them to
+  // jobAssets under the copy's own id - which would leave the
+  // duplicate's photos pointing at asset rows that conceptually belong
+  // to the ORIGINAL job, so deleting either job later could break or
+  // orphan the other's photos. Giving every photo a fresh id and
+  // letting saveJob() write it fresh keeps the two jobs' assets
+  // completely independent, exactly like the rest of the duplicate.
+  (copy.lineItems || []).forEach((row) => {
+    (row.photos || []).forEach((p) => {
+      p.id = uid();
+      delete p._assetHydrated;
+    });
+  });
+  (copy.attachments || []).forEach((a) => {
+    a.id = uid();
+    delete a._assetHydrated;
+  });
+
   await MwtDB.saveJob(copy);
   await refreshJobsCache();
   toast("Job duplicated.", "success");
@@ -1288,8 +1605,26 @@ function renderActionBar(job, schema) {
     class: "btn btn-outline",
     onclick: async () => {
       collectFormData();
-      await persistJob(job);
-      toast("Job saved.", "success");
+      // Same revision-based guard as autosave: Manual Save always saves
+      // whatever is currently on screen (the latest state, since
+      // job.fields/lineItems are mutated in place as the installer
+      // types), but if a NEWER edit happens while this save is still
+      // awaiting IndexedDB, that edit will have bumped the revision and
+      // scheduled its own autosave - so this save's own completion
+      // must not clear "Unsaved changes" out from under it.
+      const scheduledJob = job;
+      const scheduledRevision = _latestEditRevision(job.id);
+      try {
+        await persistJob(job, { editRevision: scheduledRevision });
+        if (state.currentJob === scheduledJob && _latestEditRevision(scheduledJob.id) === scheduledRevision) {
+          state.dirty = false;
+        }
+        toast("Job saved.", "success");
+      } catch (err) {
+        // persistJob() already shows its own clear error and sets the
+        // indicator to its error state - avoid a second, contradictory
+        // "Job saved" success toast on top of that.
+      }
     }
   }, "\uD83D\uDCBE  Save");
 
@@ -1297,7 +1632,17 @@ function renderActionBar(job, schema) {
     class: "btn btn-navy",
     onclick: async () => {
       collectFormData();
-      await persistJob(job, { silent: true });
+      try {
+        await persistJob(job, { silent: true });
+      } catch (err) {
+        // Do NOT proceed to PDF generation on a job that failed to
+        // save - the job remains open/untouched here. persistJob() was
+        // called with {silent:true} so it does not show its own toast
+        // for this attempt; show one clear, Preview-specific message
+        // instead so the installer isn't left with no feedback at all.
+        toast("This job could not be saved, so the PDF preview was not opened. Please keep this job open.", "error");
+        return;
+      }
       await previewPdf(job, schema);
     }
   }, "\uD83D\uDCC4  Preview PDF");
@@ -2097,7 +2442,18 @@ async function doSubmit(job, schema) {
     job.pendingResubmissionId = uid();
   }
 
-  await persistJob(job, { silent: true });
+  try {
+    await persistJob(job, { silent: true });
+  } catch (err) {
+    // Do NOT silently hang, generate a PDF, or attempt to send an
+    // incomplete/unsaved job - persistJob() already logged the real
+    // error and set the save indicator; this adds a clear, specific
+    // explanation for why Submit & Send did not proceed. No processing
+    // overlay has been shown yet at this point, so there's nothing to
+    // dismiss - the job remains exactly as it was, open and unsubmitted.
+    toast("This job could not be saved, so it was not submitted. Please keep this job open and do not close or refresh the app.", "error");
+    return;
+  }
 
   if (!navigator.onLine) {
     // For a job that has never been submitted, "ready" correctly means
@@ -2110,7 +2466,15 @@ async function doSubmit(job, schema) {
     // next online attempt picks up exactly where this one left off.
     if (!isResend) {
       job.status = "ready";
-      await persistJob(job, { silent: true });
+      try {
+        await persistJob(job, { silent: true });
+      } catch (err) {
+        // The job is still genuinely queued/unsent either way - this
+        // only affects whether that "ready" status itself made it to
+        // disk. Already surfaced via persistJob()'s own error handling;
+        // fall through to the normal offline messaging below rather
+        // than compounding it with a second, confusing error.
+      }
     }
     toast("No internet connection. Your project is saved. Please submit when a connection is available.", "error");
     render();
@@ -2235,8 +2599,16 @@ async function doSubmit(job, schema) {
         job.status = "submitted";
         job.submittedAt = nowStamp();
         job.revision = (job.revision || 0) + 1;
-        await persistJob(job, { silent: true });
-        toast("Submitted successfully.", "success");
+        try {
+          await persistJob(job, { silent: true });
+          toast("Submitted successfully.", "success");
+        } catch (err) {
+          // The email genuinely was already sent and confirmed by the
+          // backend at this point - only recording that locally failed.
+          // Say so plainly rather than a flat "Submitted successfully"
+          // that would overstate what's actually saved on this tablet.
+          toast("Submitted successfully, but this tablet could not record it locally. Please keep this job open and try Save again.", "error");
+        }
         render();
       } else {
         // Do NOT mark the job submitted, clear it, or claim success - the
@@ -2518,7 +2890,10 @@ function renderAuthScreen(role) {
 // ---------------------------------------------------------------
 async function cleanupOldSubmittedJobs() {
   try {
-    const jobs = await MwtDB.getAllJobs();
+    // Only status/submittedAt/id are needed here - the lightweight
+    // summaries path never touches jobAssets, so this runs on every app
+    // open without hydrating any photo data at all.
+    const jobs = await MwtDB.getAllJobSummaries();
     const cutoffMs = (MWT_CONFIG.submittedJobRetentionDays || 60) * 24 * 60 * 60 * 1000;
     const now = Date.now();
     for (const job of jobs) {
