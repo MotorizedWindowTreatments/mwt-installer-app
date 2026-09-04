@@ -6,7 +6,13 @@
    across the page the way the old website PDFs were.
    ============================================================ */
 
-function buildJobPdfBlob(job, schema) {
+async function buildJobPdfBlob(job, schema, opts) {
+  opts = opts || {};
+  const isLargeMode = !!opts.largePhotoMode;
+  const totalImages = opts.totalImageCount || 0;
+  const onProgress = typeof opts.onProgress === "function" ? opts.onProgress : null;
+  let processedImages = 0;
+
   const { jsPDF } = window.jspdf;
   const wide = schema.lineItems && schema.lineItems.columns.length > 8;
   const doc = new jsPDF({ orientation: wide ? "landscape" : "portrait", unit: "pt", format: "letter" });
@@ -21,6 +27,46 @@ function buildJobPdfBlob(job, schema) {
       doc.addPage();
       y = 40;
     }
+  }
+
+  // Renders exactly one photo at position (x, y) - shared by both the
+  // per-line PROJECT PHOTOS section and the ATTACHED JOB PHOTOS
+  // section below. In large-photo-job mode, a TEMPORARY, in-memory-only
+  // resized/recompressed copy of this one image is what actually gets
+  // handed to addImage() - the original dataURL (row.photos[].dataUrl
+  // or job.attachments[].dataUrl, i.e. the installer's saved data) is
+  // only ever read here, never mutated, and the temporary optimized
+  // copy is discarded immediately after this single call - no array of
+  // optimized copies is ever built up. For a normal (non-large-mode)
+  // job, the original dataURL is passed straight through exactly as
+  // before, byte-for-byte identical to current production behavior.
+  async function renderPhotoImage(dataUrl, x, y, thumbW, thumbH) {
+    let toRender = dataUrl;
+    if (isLargeMode) {
+      try {
+        toRender = await compressDataUrlForPdf(dataUrl, LARGE_PHOTO_PDF_MAX_DIM, LARGE_PHOTO_PDF_QUALITY);
+      } catch (e) {
+        // Optimization failed for this one image only - safely fall
+        // back to the original dataURL rather than losing the photo or
+        // failing the whole PDF over it. The existing addImage()
+        // fallback below still applies on top of this if even that
+        // fails.
+        toRender = dataUrl;
+      }
+    }
+    try {
+      doc.addImage(toRender, undefined, x, y, thumbW, thumbH, undefined, "FAST");
+    } catch (e) {
+      doc.rect(x, y, thumbW, thumbH);
+      doc.setFontSize(8);
+      doc.text("Could not preview", x + 8, y + thumbH / 2);
+    }
+    toRender = null; // release the temporary optimized copy immediately
+    processedImages++;
+    if (onProgress) onProgress(processedImages, totalImages);
+    // Yielding only happens in large-photo mode - a normal job's
+    // generation timing/behavior is otherwise unaffected.
+    if (isLargeMode) await yieldToEventLoop();
   }
 
   function drawHeader() {
@@ -336,9 +382,10 @@ function buildJobPdfBlob(job, schema) {
       const thumbH = wide ? 165 : 130;
       const gap = 14;
 
-      job.lineItems.forEach((row, idx) => {
+      for (let idx = 0; idx < job.lineItems.length; idx++) {
+        const row = job.lineItems[idx];
         const photos = row.photos || [];
-        if (!photos.length) return;
+        if (!photos.length) continue;
 
         ensureSpace(thumbH + 40);
         doc.setFont("helvetica", "bold");
@@ -348,21 +395,14 @@ function buildJobPdfBlob(job, schema) {
         y += 16;
 
         let x = marginX;
-        photos.forEach((p) => {
+        for (const p of photos) {
           if (x + thumbW > pageWidth - marginX) { x = marginX; y += thumbH + 22; }
           if (y + thumbH + 22 > pageHeight - 30) { doc.addPage(wide ? "landscape" : "portrait"); y = 40; x = marginX; }
-          try {
-            doc.addImage(p.dataUrl, undefined, x, y, thumbW, thumbH, undefined, "FAST");
-          } catch (e) {
-            doc.rect(x, y, thumbW, thumbH);
-            doc.setFontSize(8);
-            doc.text("Could not preview", x + 8, y + thumbH / 2);
-          }
+          await renderPhotoImage(p.dataUrl, x, y, thumbW, thumbH);
           x += thumbW + gap;
-        });
+        }
         y += thumbH + 28;
-        x = marginX;
-      });
+      }
     }
   }
 
@@ -389,16 +429,10 @@ function buildJobPdfBlob(job, schema) {
     const gap = 14;
     let x = marginX;
 
-    attachmentImages.forEach((a) => {
+    for (const a of attachmentImages) {
       if (x + thumbW > pageWidth - marginX) { x = marginX; y += thumbH + 22; }
       if (y + thumbH + 22 > pageHeight - 30) { doc.addPage(wide ? "landscape" : "portrait"); y = 40; x = marginX; }
-      try {
-        doc.addImage(a.dataUrl, undefined, x, y, thumbW, thumbH, undefined, "FAST");
-      } catch (e) {
-        doc.rect(x, y, thumbW, thumbH);
-        doc.setFontSize(8);
-        doc.text("Could not preview", x + 8, y + thumbH / 2);
-      }
+      await renderPhotoImage(a.dataUrl, x, y, thumbW, thumbH);
       // Filename caption directly under each thumbnail, where practical
       // (truncated to fit the thumbnail's own width so it never runs
       // into the next photo).
@@ -407,7 +441,7 @@ function buildJobPdfBlob(job, schema) {
       const captionLines = doc.splitTextToSize(a.name || "", thumbW);
       doc.text(captionLines[0] || "", x, y + thumbH + 10);
       x += thumbW + gap;
-    });
+    }
     y += thumbH + 28;
   }
 
