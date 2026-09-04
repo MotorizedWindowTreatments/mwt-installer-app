@@ -230,6 +230,7 @@ button, input, select, textarea {
 }
 #topbar .save-indicator.saved { color: var(--mwt-green); }
 #topbar .save-indicator.unsaved { color: var(--mwt-amber); }
+#topbar .save-indicator.error { color: var(--mwt-red); font-weight: 600; }
 
 #content {
   flex: 1;
