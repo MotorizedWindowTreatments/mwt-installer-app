@@ -1448,11 +1448,195 @@ async function showPdfDocument(blob, opts) {
   }
 }
 
+// ---------------------------------------------------------------
+// Large-photo-job PDF optimization (rendering-time only)
+//
+// A genuinely photo-heavy regular job (Matthew's real stress case:
+// ~172 line items, ~40 photos) could freeze the iPad while
+// buildJobPdfBlob() was synchronously running every photo at its full
+// stored resolution through jsPDF. This never touches the STORED
+// photo data (row.photos[].dataUrl / job.attachments[].dataUrl) at
+// all - only a temporary, in-memory-only, resized/recompressed copy of
+// each image is ever handed to jsPDF's addImage() when large-photo
+// mode is active, one photo at a time, and only for jobs that actually
+// need it (line-item COUNT alone never triggers this).
+// ---------------------------------------------------------------
+
+const LARGE_PHOTO_JOB_IMAGE_COUNT_THRESHOLD = 20;
+const LARGE_PHOTO_JOB_BYTES_THRESHOLD = 12 * 1024 * 1024; // 12 MB
+const LARGE_PHOTO_PDF_MAX_DIM = 1200;
+const LARGE_PHOTO_PDF_QUALITY = 0.78;
+
+// Prefers the recorded `size` field (set at upload time), but safely
+// estimates from the dataUrl's own length for older records that may
+// not have perfect size metadata - never treats a missing size as
+// zero, since that could under-count and fail to activate large-photo
+// mode for a job that genuinely needs it.
+function estimateStoredImageBytes(item) {
+  if (item && typeof item.size === "number" && item.size > 0) return item.size;
+  if (item && typeof item.dataUrl === "string" && item.dataUrl.length) {
+    // Base64 encodes 3 bytes as 4 characters - the same length*0.75
+    // approximation already used elsewhere in this app (see
+    // compressImageFile's own size accounting) for exactly this
+    // purpose.
+    return Math.round(item.dataUrl.length * 0.75);
+  }
+  return 0;
+}
+
+// Every image that will actually be rendered in the PDF, in the same
+// order pdf.js renders them (line-item photos first, then image
+// attachments) - used both for large-photo-job detection and to give
+// buildJobPdfBlob() a total count for "Preparing photo X of Y"
+// progress. Never includes non-image attachments.
+function collectJobPdfImages(job) {
+  const images = [];
+  (job.lineItems || []).forEach((row) => {
+    (row.photos || []).forEach((p) => { images.push(p); });
+  });
+  (job.attachments || []).forEach((a) => {
+    if (a.type && a.type.startsWith("image/")) images.push(a);
+  });
+  return images;
+}
+
+// Count-based OR byte-based - either one alone is enough to activate
+// large-photo mode. Deliberately never triggered by line-item count by
+// itself (172 text-only measurement rows is not, on its own, a reason
+// to recompress anything).
+function isLargePhotoJob(job) {
+  const images = collectJobPdfImages(job);
+  if (images.length >= LARGE_PHOTO_JOB_IMAGE_COUNT_THRESHOLD) return true;
+  let totalBytes = 0;
+  for (const img of images) totalBytes += estimateStoredImageBytes(img);
+  return totalBytes >= LARGE_PHOTO_JOB_BYTES_THRESHOLD;
+}
+
+// Produces a TEMPORARY, resized/recompressed copy of an existing
+// stored dataURL for PDF rendering only - takes a dataURL directly
+// (not a File), unlike compressImageFile() above, which is the
+// existing UPLOAD-time compression helper and is left completely
+// untouched by this. The original dataURL passed in is only ever read,
+// never mutated, and the returned value is not written back anywhere -
+// callers use it for one addImage() call and then let it go.
+function compressDataUrlForPdf(dataUrl, maxDim, quality) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => {
+      // The ENTIRE processing body is wrapped here - resize math,
+      // canvas creation, getContext, drawImage, and toDataURL - so that
+      // an exception at ANY of those steps properly rejects the promise
+      // instead of potentially throwing uncaught inside this plain
+      // onload callback and leaving the promise pending forever. That
+      // matters especially here: this feature exists specifically for
+      // memory-constrained iPads, where a stuck-pending optimization
+      // could stall the whole submission.
+      let canvas = null;
+      try {
+        let { width, height } = img;
+        if (width > maxDim || height > maxDim) {
+          if (width >= height) {
+            height = Math.round(height * (maxDim / width));
+            width = maxDim;
+          } else {
+            width = Math.round(width * (maxDim / height));
+            height = maxDim;
+          }
+        }
+        canvas = document.createElement("canvas");
+        canvas.width = width;
+        canvas.height = height;
+        const ctx = canvas.getContext("2d");
+        if (!ctx) throw new Error("Could not get a 2D canvas context for PDF image optimization.");
+        ctx.drawImage(img, 0, 0, width, height);
+        const optimized = canvas.toDataURL("image/jpeg", quality);
+        resolve(optimized);
+      } catch (err) {
+        reject(err);
+      } finally {
+        // Release the temporary canvas either way - success or
+        // failure - never left referencing pixel data longer than this
+        // one photo's turn. The original dataUrl/img.src passed in is
+        // never touched here, only read.
+        if (canvas) {
+          canvas.width = 0;
+          canvas.height = 0;
+          canvas = null;
+        }
+      }
+    };
+    img.onerror = () => reject(new Error("Could not load image for PDF optimization"));
+    img.src = dataUrl;
+  });
+}
+
+// iOS-safe yield: requestAnimationFrame alone can be throttled/starved
+// under heavy synchronous work, and requestIdleCallback's Safari
+// support/behavior is unreliable, so this combines a frame callback
+// with a 0ms timeout fallback to reliably hand control back to the
+// browser (so it can actually paint/respond) between photo operations.
+function yieldToEventLoop() {
+  return new Promise((resolve) => {
+    if (typeof requestAnimationFrame === "function") {
+      requestAnimationFrame(() => setTimeout(resolve, 0));
+    } else {
+      setTimeout(resolve, 0);
+    }
+  });
+}
+
+// Full-screen "Preparing PDF..." state, shown immediately after the
+// installer confirms Submit & Send or Preview PDF, before any heavy
+// PDF work begins - reuses the existing .pdf-viewer-overlay / .help-text
+// styling (same dark full-screen backdrop already used by the Admin PDF
+// viewer's own loading state) rather than introducing new CSS.
+function showPreparingPdfOverlay() {
+  const overlay = el("div", { class: "pdf-viewer-overlay" });
+  const msg = el("div", { style: "padding:30px 24px 8px;text-align:center;color:#fff;font-size:16px;font-weight:600;" }, "Preparing PDF\u2026");
+  const sub = el("div", { style: "padding:0 24px;text-align:center;color:rgba(255,255,255,0.75);font-size:13px;" },
+    "Large jobs with many photos may take a moment. Please keep the app open.");
+  overlay.appendChild(msg);
+  overlay.appendChild(sub);
+  document.body.appendChild(overlay);
+  document.body.classList.add("pdf-viewer-open");
+  return {
+    updateProgress(current, total) {
+      msg.textContent = "Preparing photo " + current + " of " + total + "\u2026";
+    },
+    // Switches the overlay to a different stage without ever
+    // closing/reopening it - used by Submit & Send to move from
+    // "Preparing PDF..." to "Sending..." so the SAME overlay instance
+    // stays visible for the whole submission transaction (PDF
+    // generation through the network round trip), not just the
+    // PDF-generation portion.
+    setStage(title, subtitle) {
+      msg.textContent = title;
+      sub.textContent = subtitle;
+    },
+    close() {
+      overlay.remove();
+      document.body.classList.remove("pdf-viewer-open");
+    }
+  };
+}
+
 async function previewPdf(job, schema) {
+  // Overlay must actually paint BEFORE the (possibly heavy) PDF work
+  // starts - show it, then yield one frame/event-loop turn, then begin.
+  const overlay = showPreparingPdfOverlay();
+  await yieldToEventLoop();
   try {
-    const blob = buildJobPdfBlob(job, schema);
+    const images = collectJobPdfImages(job);
+    const largeMode = isLargePhotoJob(job);
+    const blob = await buildJobPdfBlob(job, schema, {
+      largePhotoMode: largeMode,
+      totalImageCount: images.length,
+      onProgress: largeMode ? (cur, total) => overlay.updateProgress(cur, total) : null
+    });
+    overlay.close();
     await showPdfDocument(blob, { title: "PDF Preview", filename: pdfFileName(job, schema) });
   } catch (err) {
+    overlay.close();
     console.error(err);
     toast("Could not generate the PDF preview: " + err.message, "error");
   }
@@ -1933,100 +2117,147 @@ async function doSubmit(job, schema) {
     return;
   }
 
-  const blob = buildJobPdfBlob(job, schema);
-  const fileName = pdfFileName(job, schema);
-  const jobName = computeDisplayName(job);
-  const formType = schema.label || schema.pdfTitle;
-  // Email subject is ONLY "Design Firm - Sidemark" (e.g. "MWT \u2013 Kandl"),
-  // built directly from the entered field values - NOT the manually
-  // entered Job Name, and with no form name appended. (The PDF's own
-  // "Job Name" line still uses computeDisplayName() as before - this
-  // only affects the email subject.) Unchanged for a resend - no
-  // revision number or "UPDATED" marker is added to the subject in
-  // this revision.
-  const subject = buildEmailSubject(job);
-  const designerEmail = getDesignerEmail(job);
+  const overlay = showPreparingPdfOverlay();
+  // Overlay must actually paint BEFORE the (possibly heavy) PDF work
+  // starts - show it, then yield one frame/event-loop turn, then begin.
+  await yieldToEventLoop();
 
-  // Backward-compat: a job saved before this update won't have a
-  // submissionId yet - generate one now rather than block submission.
-  if (!job.submissionId) job.submissionId = uid();
-
-  // The id actually sent to the backend for THIS request: the pending
-  // resend id for an intentional resend, or the job's normal
-  // submissionId otherwise (first-time submission, or a plain retry of
-  // a first-time submission that has not yet succeeded).
-  const submissionIdForRequest = isResend ? job.pendingResubmissionId : job.submissionId;
-
+  // The overlay stays up for the ENTIRE submission transaction - PDF
+  // generation AND the Base64 conversion/network round trip that
+  // follows it - not just PDF generation. Closing it right after
+  // buildJobPdfBlob() would let the (already-dismissed) confirm modal's
+  // underlying screen become visible again, exposing the Submit button
+  // while a request is still genuinely in flight - on a large job this
+  // can look exactly like the original frozen-Submit&Send problem this
+  // whole feature exists to fix. A single try/finally around the whole
+  // transaction guarantees the overlay closes on every exit path (PDF
+  // failure, Base64 failure, network error, backend error, or success)
+  // and can never be left stuck on screen.
   try {
-    const base64Pdf = await blobToBase64(blob);
+    let blob;
+    try {
+      const images = collectJobPdfImages(job);
+      const largeMode = isLargePhotoJob(job);
+      blob = await buildJobPdfBlob(job, schema, {
+        largePhotoMode: largeMode,
+        totalImageCount: images.length,
+        onProgress: largeMode ? (cur, total) => overlay.updateProgress(cur, total) : null
+      });
+    } catch (err) {
+      // PDF generation genuinely failed - the outer finally below still
+      // closes the overlay; the job stays saved and NOT marked
+      // submitted (nor is a resend's pendingResubmissionId cleared - a
+      // retry will reuse it correctly).
+      console.error("PDF generation failed:", err);
+      toast("Could not generate the PDF. Your job is still saved. Please try again.", "error");
+      return;
+    }
 
-    // The backend is a Google Apps Script Web App. Sending the request
-    // with Content-Type "text/plain" (rather than "application/json")
-    // keeps this a CORS "simple request" - Apps Script Web Apps don't
-    // reliably answer the OPTIONS preflight a JSON content-type would
-    // trigger, which silently breaks the request in the browser. The
-    // body itself is still plain JSON text; Apps Script parses it with
-    // JSON.parse(e.postData.contents) on the other end.
-    //
-    // Note: only the (optional, validated) designerEmail is sent - the
-    // app never sends a recipient list. The three fixed company
-    // addresses are hard-coded server-side and cannot be changed or
-    // seen from here.
-    const payloadBody = JSON.stringify({
-      action: "submit",
-      installerToken: getDeviceToken(),
-      submissionId: submissionIdForRequest,
-      subject,
-      filename: fileName,
-      jobName,
-      formType,
-      designFirm: job.fields.designFirm || "",
-      sidemark: job.fields.sidemark || "",
-      projectNumber: job.projectNumber || "",
-      designerEmail,
-      pdfBase64: base64Pdf
-    });
+    // PDF generation is done, but the submission itself is not - switch
+    // the SAME overlay to the next stage (never close/reopen it here)
+    // and yield once so the new message actually paints before the
+    // network work begins.
+    overlay.setStage("Sending\u2026", "Please keep the app open until the submission is complete.");
+    await yieldToEventLoop();
 
-    const resp = await fetch(MWT_CONFIG.submitApiUrl, {
-      method: "POST",
-      headers: { "Content-Type": "text/plain;charset=utf-8" },
-      body: payloadBody
-    });
+    const fileName = pdfFileName(job, schema);
+    const jobName = computeDisplayName(job);
+    const formType = schema.label || schema.pdfTitle;
+    // Email subject is ONLY "Design Firm - Sidemark" (e.g. "MWT \u2013 Kandl"),
+    // built directly from the entered field values - NOT the manually
+    // entered Job Name, and with no form name appended. (The PDF's own
+    // "Job Name" line still uses computeDisplayName() as before - this
+    // only affects the email subject.) Unchanged for a resend - no
+    // revision number or "UPDATED" marker is added to the subject in
+    // this revision.
+    const subject = buildEmailSubject(job);
+    const designerEmail = getDesignerEmail(job);
 
-    let payload = null;
-    try { payload = await resp.json(); } catch (parseErr) { /* non-JSON error response, handled below */ }
+    // Backward-compat: a job saved before this update won't have a
+    // submissionId yet - generate one now rather than block submission.
+    if (!job.submissionId) job.submissionId = uid();
 
-    if (resp.ok && payload && payload.success) {
-      if (isResend) {
-        // The resend is now confirmed successful - the new id becomes
-        // the job's current submissionId, and the temporary pending
-        // state is cleared only now, after that success is confirmed
-        // (never before, so a retry after any earlier failure always
-        // had the same id to reuse).
-        job.submissionId = job.pendingResubmissionId;
-        job.pendingResubmissionId = null;
+    // The id actually sent to the backend for THIS request: the pending
+    // resend id for an intentional resend, or the job's normal
+    // submissionId otherwise (first-time submission, or a plain retry of
+    // a first-time submission that has not yet succeeded).
+    const submissionIdForRequest = isResend ? job.pendingResubmissionId : job.submissionId;
+
+    try {
+      const base64Pdf = await blobToBase64(blob);
+
+      // The backend is a Google Apps Script Web App. Sending the request
+      // with Content-Type "text/plain" (rather than "application/json")
+      // keeps this a CORS "simple request" - Apps Script Web Apps don't
+      // reliably answer the OPTIONS preflight a JSON content-type would
+      // trigger, which silently breaks the request in the browser. The
+      // body itself is still plain JSON text; Apps Script parses it with
+      // JSON.parse(e.postData.contents) on the other end.
+      //
+      // Note: only the (optional, validated) designerEmail is sent - the
+      // app never sends a recipient list. The three fixed company
+      // addresses are hard-coded server-side and cannot be changed or
+      // seen from here.
+      const payloadBody = JSON.stringify({
+        action: "submit",
+        installerToken: getDeviceToken(),
+        submissionId: submissionIdForRequest,
+        subject,
+        filename: fileName,
+        jobName,
+        formType,
+        designFirm: job.fields.designFirm || "",
+        sidemark: job.fields.sidemark || "",
+        projectNumber: job.projectNumber || "",
+        designerEmail,
+        pdfBase64: base64Pdf
+      });
+
+      const resp = await fetch(MWT_CONFIG.submitApiUrl, {
+        method: "POST",
+        headers: { "Content-Type": "text/plain;charset=utf-8" },
+        body: payloadBody
+      });
+
+      let payload = null;
+      try { payload = await resp.json(); } catch (parseErr) { /* non-JSON error response, handled below */ }
+
+      if (resp.ok && payload && payload.success) {
+        if (isResend) {
+          // The resend is now confirmed successful - the new id becomes
+          // the job's current submissionId, and the temporary pending
+          // state is cleared only now, after that success is confirmed
+          // (never before, so a retry after any earlier failure always
+          // had the same id to reuse).
+          job.submissionId = job.pendingResubmissionId;
+          job.pendingResubmissionId = null;
+        }
+        job.status = "submitted";
+        job.submittedAt = nowStamp();
+        job.revision = (job.revision || 0) + 1;
+        await persistJob(job, { silent: true });
+        toast("Submitted successfully.", "success");
+        render();
+      } else {
+        // Do NOT mark the job submitted, clear it, or claim success - the
+        // email genuinely was not confirmed sent. The job stays saved so
+        // the installer can simply try again once the issue is resolved.
+        // For a resend, pendingResubmissionId is deliberately left set,
+        // so that retry reuses the exact same id rather than minting a
+        // new one.
+        const errMsg = (payload && payload.error) ? payload.error : ("Server returned status " + resp.status);
+        console.error("Submit & Send failed:", errMsg);
+        toast("Submission could not be emailed. Your job is still saved. Please try again.", "error");
       }
-      job.status = "submitted";
-      job.submittedAt = nowStamp();
-      job.revision = (job.revision || 0) + 1;
-      await persistJob(job, { silent: true });
-      toast("Submitted successfully.", "success");
-      render();
-    } else {
-      // Do NOT mark the job submitted, clear it, or claim success - the
-      // email genuinely was not confirmed sent. The job stays saved so
-      // the installer can simply try again once the issue is resolved.
-      // For a resend, pendingResubmissionId is deliberately left set,
-      // so that retry reuses the exact same id rather than minting a
-      // new one.
-      const errMsg = (payload && payload.error) ? payload.error : ("Server returned status " + resp.status);
-      console.error("Submit & Send failed:", errMsg);
+    } catch (err) {
+      // Network error, backend unreachable/not deployed yet, CORS failure, etc.
+      console.error("Submit & Send failed:", err);
       toast("Submission could not be emailed. Your job is still saved. Please try again.", "error");
     }
-  } catch (err) {
-    // Network error, backend unreachable/not deployed yet, CORS failure, etc.
-    console.error("Submit & Send failed:", err);
-    toast("Submission could not be emailed. Your job is still saved. Please try again.", "error");
+  } finally {
+    // Guaranteed to run on every exit path above - the processing
+    // overlay can never be left stuck on screen.
+    overlay.close();
   }
 }
 
