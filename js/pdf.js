@@ -9,13 +9,20 @@
 async function buildJobPdfBlob(job, schema, opts) {
   opts = opts || {};
   const isLargeMode = !!opts.largePhotoMode;
+  // Falls back to the original large-photo defaults if a caller
+  // doesn't specify these (keeps this function's own contract backward
+  // compatible) - the actual profile selection (normal/large/very
+  // large) lives entirely in app.js, which is the only place that
+  // needs to know about profile thresholds/names.
+  const photoMaxDim = opts.photoMaxDim || 1200;
+  const photoQuality = opts.photoQuality || 0.78;
   const totalImages = opts.totalImageCount || 0;
   const onProgress = typeof opts.onProgress === "function" ? opts.onProgress : null;
   let processedImages = 0;
 
   const { jsPDF } = window.jspdf;
   const wide = schema.lineItems && schema.lineItems.columns.length > 8;
-  const doc = new jsPDF({ orientation: wide ? "landscape" : "portrait", unit: "pt", format: "letter" });
+  const doc = new jsPDF({ orientation: wide ? "landscape" : "portrait", unit: "pt", format: "letter", compress: true });
 
   const marginX = 36;
   let y = 40;
@@ -44,7 +51,7 @@ async function buildJobPdfBlob(job, schema, opts) {
     let toRender = dataUrl;
     if (isLargeMode) {
       try {
-        toRender = await compressDataUrlForPdf(dataUrl, LARGE_PHOTO_PDF_MAX_DIM, LARGE_PHOTO_PDF_QUALITY);
+        toRender = await compressDataUrlForPdf(dataUrl, photoMaxDim, photoQuality);
       } catch (e) {
         // Optimization failed for this one image only - safely fall
         // back to the original dataURL rather than losing the photo or
@@ -470,7 +477,7 @@ async function buildJobPdfBlob(job, schema, opts) {
 function buildItineraryPdfBlob(itinerary, opts) {
   opts = opts || {};
   const { jsPDF } = window.jspdf;
-  const doc = new jsPDF({ orientation: "portrait", unit: "pt", format: "letter" });
+  const doc = new jsPDF({ orientation: "portrait", unit: "pt", format: "letter", compress: true });
 
   const marginX = 36;
   let y = 40;
