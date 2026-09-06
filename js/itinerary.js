@@ -1153,6 +1153,7 @@ async function renderItineraryAdminSection(resultsBox, filterBar) {
         el("td", {}, r.totalReimbursable != null ? "$" + Number(r.totalReimbursable).toFixed(2) : "\u2014"),
         el("td", {}, [
           el("button", { class: "btn btn-ghost", onclick: () => viewItineraryPdf(r) }, "View PDF"),
+          el("button", { class: "btn btn-ghost", onclick: () => downloadAdminPdf("getItineraryPdf", getAdminToken(), r.submissionId, r.pdfFilename) }, "Download PDF"),
           el("button", { class: "btn btn-ghost itinerary-admin-delete-btn", onclick: () => confirmDeleteItinerary(r) }, "Delete")
         ])
       ]));
