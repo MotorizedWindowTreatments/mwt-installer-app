@@ -1809,8 +1809,19 @@ async function showPdfDocument(blob, opts) {
 
 const LARGE_PHOTO_JOB_IMAGE_COUNT_THRESHOLD = 20;
 const LARGE_PHOTO_JOB_BYTES_THRESHOLD = 12 * 1024 * 1024; // 12 MB
-const LARGE_PHOTO_PDF_MAX_DIM = 1200;
-const LARGE_PHOTO_PDF_QUALITY = 0.78;
+const VERY_LARGE_PHOTO_JOB_IMAGE_COUNT_THRESHOLD = 40;
+const VERY_LARGE_PHOTO_JOB_BYTES_THRESHOLD = 25 * 1024 * 1024; // ~25 MB
+
+// Adaptive PDF-rendering-time compression profiles. A normal/small job
+// (below the "large" thresholds) is never recompressed at all - the
+// original stored image data is used exactly as before this change.
+// These are photos shown as relatively small project-photo thumbnails
+// inside the PDF, so each profile is tuned for a strong visual-
+// quality/file-size balance at that size, not archival fidelity.
+const PHOTO_COMPRESSION_PROFILES = {
+  large: { maxDim: 900, quality: 0.68 },
+  veryLarge: { maxDim: 800, quality: 0.62 }
+};
 
 // Prefers the recorded `size` field (set at upload time), but safely
 // estimates from the dataUrl's own length for older records that may
@@ -1845,17 +1856,29 @@ function collectJobPdfImages(job) {
   return images;
 }
 
-// Count-based OR byte-based - either one alone is enough to activate
-// large-photo mode. Deliberately never triggered by line-item count by
-// itself (172 text-only measurement rows is not, on its own, a reason
-// to recompress anything).
-function isLargePhotoJob(job) {
+// Determines which PDF-rendering-time photo compression profile a job
+// falls into, based on total in-PDF image count and estimated total
+// source bytes - never based on line-item count alone (172 text-only
+// measurement rows is not, on its own, a reason to recompress
+// anything). "veryLarge" takes precedence whenever EITHER of its own
+// thresholds is reached, even if the job would also independently
+// qualify for "large" - a job is only ever in exactly one profile.
+// Returns null for a normal job: use the original stored image data
+// completely unmodified, exactly as before this change.
+function getPhotoCompressionProfile(job) {
   const images = collectJobPdfImages(job);
-  if (images.length >= LARGE_PHOTO_JOB_IMAGE_COUNT_THRESHOLD) return true;
   let totalBytes = 0;
   for (const img of images) totalBytes += estimateStoredImageBytes(img);
-  return totalBytes >= LARGE_PHOTO_JOB_BYTES_THRESHOLD;
+
+  if (images.length >= VERY_LARGE_PHOTO_JOB_IMAGE_COUNT_THRESHOLD || totalBytes >= VERY_LARGE_PHOTO_JOB_BYTES_THRESHOLD) {
+    return "veryLarge";
+  }
+  if (images.length >= LARGE_PHOTO_JOB_IMAGE_COUNT_THRESHOLD || totalBytes >= LARGE_PHOTO_JOB_BYTES_THRESHOLD) {
+    return "large";
+  }
+  return null;
 }
+
 
 // Produces a TEMPORARY, resized/recompressed copy of an existing
 // stored dataURL for PDF rendering only - takes a dataURL directly
@@ -1972,9 +1995,13 @@ async function previewPdf(job, schema) {
   await yieldToEventLoop();
   try {
     const images = collectJobPdfImages(job);
-    const largeMode = isLargePhotoJob(job);
+    const profile = getPhotoCompressionProfile(job);
+    const largeMode = profile !== null;
+    const settings = profile ? PHOTO_COMPRESSION_PROFILES[profile] : null;
     const blob = await buildJobPdfBlob(job, schema, {
       largePhotoMode: largeMode,
+      photoMaxDim: settings ? settings.maxDim : undefined,
+      photoQuality: settings ? settings.quality : undefined,
       totalImageCount: images.length,
       onProgress: largeMode ? (cur, total) => overlay.updateProgress(cur, total) : null
     });
@@ -2048,103 +2075,375 @@ function base64ToUint8ArrayChunked(base64) {
 class PdfLoadError extends Error {
   constructor(kind, message) {
     super(message);
-    this.kind = kind; // "auth" | "notfound" | "backend" | "invalid" | "timeout" | "network"
+    this.kind = kind; // "auth" | "notfound" | "backend" | "invalid" | "timeout" | "network" | "cancelled"
   }
 }
 
-// Fetches and decodes one archived PDF's bytes for the Admin viewer.
-// `action` is "getSubmissionPdf" or "getItineraryPdf" - both already
-// require a valid Admin token server-side; this function does not
-// change that, only how the response is fetched/decoded/retried.
-async function fetchAdminPdfBytes(action, adminToken, submissionId) {
-  const maxAttempts = 3; // bounded - 1 try + up to 2 retries, never unbounded
-  let lastMessage = "Could not load the PDF.";
-  let lastKind = "network";
+// Maps the existing "getSubmissionPdf" / "getItineraryPdf" action names
+// (unchanged - every call site below still passes exactly these) to
+// their new paired chunked-metadata/chunked-fetch backend actions, so
+// no caller needs to know two actions exist per PDF source.
+const ADMIN_PDF_CHUNKED_ACTIONS = {
+  getSubmissionPdf: { meta: "getSubmissionPdfMeta", chunk: "getSubmissionPdfChunk" },
+  getItineraryPdf: { meta: "getItineraryPdfMeta", chunk: "getItineraryPdfChunk" }
+};
 
-  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 25000);
+const ADMIN_PDF_CHUNK_TIMEOUT_MS = 25000; // per-request, not per-whole-file - a single ~1MB chunk should always complete well within this
+const ADMIN_PDF_CHUNK_MAX_ATTEMPTS = 3; // bounded - 1 try + up to 2 retries per CHUNK, never unbounded, and never re-fetches the whole PDF
+const ADMIN_PDF_META_MAX_ATTEMPTS = 3; // bounded retry for the metadata request only - never restarts an already-downloading PDF
+
+function classifyAdminPdfBackendError(payload) {
+  const msg = String((payload && payload.error) || "").toLowerCase();
+  if (msg.indexOf("not authorized") !== -1) return new PdfLoadError("auth", payload.error);
+  if (msg.indexOf("not found") !== -1 || msg.indexOf("could not be found") !== -1 || msg.indexOf("out of range") !== -1) {
+    return new PdfLoadError("notfound", payload.error);
+  }
+  return new PdfLoadError("backend", (payload && payload.error) || "The server reported an error.");
+}
+
+// Combines a per-request timeout with an external cancellation signal
+// (the Admin viewer's own "I was closed" signal) into ONE signal to
+// hand to fetch(), so either one aborts the actual in-flight HTTP
+// request immediately - not just a boolean checked between awaits.
+// Deliberately implemented by hand (rather than AbortSignal.any(),
+// which is not reliably available on the iPad/iPhone Safari versions
+// this app targets) so this stays broadly compatible. cleanup() must
+// be called once the request settles, either way, to clear the timer
+// and detach the listener.
+function createRequestSignal(externalSignal, timeoutMs) {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(new DOMException("Timed out", "TimeoutError")), timeoutMs);
+  function onExternalAbort() {
+    controller.abort(externalSignal.reason);
+  }
+  if (externalSignal) {
+    if (externalSignal.aborted) {
+      controller.abort(externalSignal.reason);
+    } else {
+      externalSignal.addEventListener("abort", onExternalAbort, { once: true });
+    }
+  }
+  return {
+    signal: controller.signal,
+    cleanup() {
+      clearTimeout(timeoutId);
+      if (externalSignal) externalSignal.removeEventListener("abort", onExternalAbort);
+    }
+  };
+}
+
+// Classifies a caught fetch error as "cancelled" (the viewer was
+// closed - silent, never shown to the user, never retried) vs a
+// genuine "timeout" (the per-request timer elapsed - the user should
+// be told, and it IS eligible for the normal bounded retry).
+function classifyAdminPdfFetchAbort(err, externalSignal) {
+  if (externalSignal && externalSignal.aborted) {
+    return new PdfLoadError("cancelled", "Cancelled.");
+  }
+  if (err && (err.name === "AbortError" || err.name === "TimeoutError")) {
+    return new PdfLoadError("timeout", "The PDF is taking longer than expected to load.");
+  }
+  return null; // not an abort-shaped error at all
+}
+
+// One metadata request - filename, exact byte size, and chunk count.
+// Small, but can still fail transiently due to Apps Script/network
+// latency, so this gets its OWN bounded retry (up to
+// ADMIN_PDF_META_MAX_ATTEMPTS total attempts) for transient failures
+// (backend/invalid/timeout/network) - auth/notfound/cancelled are
+// permanent and never retried. This only ever retries the metadata
+// call itself; it never restarts an already-downloading PDF, since
+// chunk downloading hasn't begun yet at this point.
+async function fetchAdminPdfMeta(metaAction, adminToken, submissionId, externalSignal) {
+  let lastErr = null;
+  for (let attempt = 1; attempt <= ADMIN_PDF_META_MAX_ATTEMPTS; attempt++) {
+    if (externalSignal && externalSignal.aborted) throw new PdfLoadError("cancelled", "Cancelled.");
+    const { signal, cleanup } = createRequestSignal(externalSignal, ADMIN_PDF_CHUNK_TIMEOUT_MS);
     try {
       const resp = await fetch(MWT_CONFIG.submitApiUrl, {
         method: "POST",
         headers: { "Content-Type": "text/plain;charset=utf-8" },
-        body: JSON.stringify({ action, adminToken, submissionId }),
-        signal: controller.signal
+        body: JSON.stringify({ action: metaAction, adminToken, submissionId }),
+        signal
       });
-      clearTimeout(timeoutId);
 
       if (!resp.ok) {
-        lastKind = "backend";
-        lastMessage = "The server had a problem (status " + resp.status + ").";
-        if (attempt < maxAttempts) { await pdfSleep(attempt * 700); continue; }
-        throw new PdfLoadError(lastKind, lastMessage);
+        lastErr = new PdfLoadError("backend", "The server had a problem (status " + resp.status + ").");
+        if (attempt < ADMIN_PDF_META_MAX_ATTEMPTS) { await pdfSleep(attempt * 500); continue; }
+        throw lastErr;
       }
 
-      let rawText;
+      // resp.json() is still under the SAME signal used for fetch()
+      // itself - the timeout timer and external-abort listener stay
+      // live through this whole call (cleanup() only runs in the
+      // finally below, after this settles), so closing the viewer or
+      // hitting the timeout while the response body is still being
+      // read/parsed aborts this immediately rather than only being
+      // noticed after it eventually finishes on its own.
       let payload;
       try {
-        rawText = await resp.text();
-        payload = JSON.parse(rawText);
+        payload = await resp.json();
       } catch (parseErr) {
-        // Invalid/truncated response - genuinely worth one retry (could
-        // be a transient blip), but not looped forever.
-        lastKind = "invalid";
-        lastMessage = "The server's response could not be read (it may have been cut off).";
-        if (attempt < maxAttempts) { await pdfSleep(attempt * 700); continue; }
-        throw new PdfLoadError(lastKind, lastMessage);
-      } finally {
-        rawText = null; // release ASAP, no need to hold the raw text once parsed
+        const abortClassified = classifyAdminPdfFetchAbort(parseErr, externalSignal);
+        if (abortClassified) {
+          if (abortClassified.kind === "cancelled") throw abortClassified;
+          lastErr = abortClassified;
+          if (attempt < ADMIN_PDF_META_MAX_ATTEMPTS) { await pdfSleep(attempt * 500); continue; }
+          throw lastErr;
+        }
+        lastErr = new PdfLoadError("invalid", "The server's response could not be read.");
+        if (attempt < ADMIN_PDF_META_MAX_ATTEMPTS) { await pdfSleep(attempt * 500); continue; }
+        throw lastErr;
       }
 
       if (!payload.success) {
-        const msg = String(payload.error || "").toLowerCase();
-        if (msg.indexOf("not authorized") !== -1) {
-          // Permanent for this session - retrying won't help.
-          throw new PdfLoadError("auth", payload.error || "Not authorized.");
-        }
-        if (msg.indexOf("could not be found") !== -1 || msg.indexOf("not found") !== -1) {
-          // Permanent - the record/file genuinely isn't there.
-          throw new PdfLoadError("notfound", payload.error || "That PDF could not be found.");
-        }
-        lastKind = "backend";
-        lastMessage = payload.error || "The server reported an error.";
-        if (attempt < maxAttempts) { await pdfSleep(attempt * 700); continue; }
-        throw new PdfLoadError(lastKind, lastMessage);
+        const classified = classifyAdminPdfBackendError(payload);
+        if (classified.kind === "auth" || classified.kind === "notfound") throw classified; // permanent
+        lastErr = classified;
+        if (attempt < ADMIN_PDF_META_MAX_ATTEMPTS) { await pdfSleep(attempt * 500); continue; }
+        throw lastErr;
       }
 
-      let base64 = payload.pdfBase64;
-      const filename = payload.filename;
-      payload.pdfBase64 = null; // release the JSON payload's own copy immediately
-      payload = null;
-      if (!base64) {
-        throw new PdfLoadError("invalid", "The server did not return any PDF data.");
+      if (!(payload.size >= 0) || !(payload.chunkCount >= 1) || !(payload.chunkSize > 0)) {
+        lastErr = new PdfLoadError("invalid", "The server did not return valid PDF information.");
+        if (attempt < ADMIN_PDF_META_MAX_ATTEMPTS) { await pdfSleep(attempt * 500); continue; }
+        throw lastErr;
       }
-      const bytes = base64ToUint8ArrayChunked(base64);
-      base64 = null; // release the base64 string as soon as it's decoded
-      return { bytes, filename };
+
+      return { filename: payload.filename, size: payload.size, chunkSize: payload.chunkSize, chunkCount: payload.chunkCount };
     } catch (err) {
-      clearTimeout(timeoutId);
-      if (err instanceof PdfLoadError) throw err;
-      if (err && err.name === "AbortError") {
-        lastKind = "timeout";
-        lastMessage = "The request timed out. Check your connection and try again.";
-        if (attempt < maxAttempts) { await pdfSleep(attempt * 700); continue; }
-        throw new PdfLoadError(lastKind, lastMessage);
+      if (err instanceof PdfLoadError) {
+        if (err.kind === "auth" || err.kind === "notfound") throw err;
+        lastErr = err;
+        if (attempt < ADMIN_PDF_META_MAX_ATTEMPTS) { await pdfSleep(attempt * 500); continue; }
+        throw err;
       }
-      lastKind = "network";
-      lastMessage = "Could not reach the server. Check your connection and try again.";
-      if (attempt < maxAttempts) { await pdfSleep(attempt * 700); continue; }
-      throw new PdfLoadError(lastKind, lastMessage);
+      const abortClassified = classifyAdminPdfFetchAbort(err, externalSignal);
+      if (abortClassified) {
+        if (abortClassified.kind === "cancelled") throw abortClassified; // permanent, silent
+        lastErr = abortClassified;
+        if (attempt < ADMIN_PDF_META_MAX_ATTEMPTS) { await pdfSleep(attempt * 500); continue; }
+        throw lastErr;
+      }
+      lastErr = new PdfLoadError("network", "Could not reach the server. Check your connection and try again.");
+      if (attempt < ADMIN_PDF_META_MAX_ATTEMPTS) { await pdfSleep(attempt * 500); continue; }
+      throw lastErr;
+    } finally {
+      // Runs ONLY after this whole attempt (fetch AND resp.json()) has
+      // fully settled, one way or another - never before the response
+      // body has actually finished being read/parsed. This is what
+      // keeps the timeout/external-abort signal genuinely active for
+      // the entire request, not just the initial fetch() call.
+      cleanup();
     }
   }
-  throw new PdfLoadError(lastKind, lastMessage);
+  throw lastErr || new PdfLoadError("network", "Could not load the PDF's information.");
+}
+
+// One chunk request, with its OWN bounded retry - a failure here only
+// ever retries THIS chunk, never restarts the whole PDF. auth/notfound/
+// cancelled are treated as permanent (retrying can't fix them, and a
+// cancellation must never trigger a retry attempt at all); backend/
+// invalid/timeout/network get up to ADMIN_PDF_CHUNK_MAX_ATTEMPTS total
+// tries with a short bounded delay between them.
+//
+// `expectedChunkSize` is the EXACT byte count this specific chunk must
+// have - the caller (fetchAdminPdfBytesChunked) already computes this
+// correctly for both a full-size chunk and the final, shorter
+// remainder chunk, so this function applies one single, strict,
+// exact-match check regardless of position: chunkIndex must exist, be
+// an integer, and match what was requested; byteLength must exist, be
+// a finite non-negative integer, and match the actually-decoded byte
+// count; and that decoded byte count must exactly equal
+// expectedChunkSize - never merely "at most". Any mismatch, for the
+// final chunk exactly as much as any other, is classified as
+// "invalid" and goes through this same bounded retry - a short final
+// chunk is caught right here, not left to be discovered later when
+// the whole file's assembled size is checked.
+async function fetchAdminPdfChunk(chunkAction, adminToken, submissionId, chunkIndex, expectedChunkSize, externalSignal) {
+  let lastErr = null;
+  for (let attempt = 1; attempt <= ADMIN_PDF_CHUNK_MAX_ATTEMPTS; attempt++) {
+    if (externalSignal && externalSignal.aborted) throw new PdfLoadError("cancelled", "Cancelled.");
+    const { signal, cleanup } = createRequestSignal(externalSignal, ADMIN_PDF_CHUNK_TIMEOUT_MS);
+    try {
+      const resp = await fetch(MWT_CONFIG.submitApiUrl, {
+        method: "POST",
+        headers: { "Content-Type": "text/plain;charset=utf-8" },
+        body: JSON.stringify({ action: chunkAction, adminToken, submissionId, chunkIndex }),
+        signal
+      });
+
+      if (!resp.ok) {
+        lastErr = new PdfLoadError("backend", "The server had a problem (status " + resp.status + ").");
+        if (attempt < ADMIN_PDF_CHUNK_MAX_ATTEMPTS) { await pdfSleep(attempt * 500); continue; }
+        throw lastErr;
+      }
+
+      // Same principle as fetchAdminPdfMeta() above - resp.json() stays
+      // under the same signal as fetch() itself, so a cancellation or
+      // timeout while this specific chunk's body is still downloading
+      // is caught here, not only after it eventually finishes.
+      let payload;
+      try {
+        payload = await resp.json();
+      } catch (parseErr) {
+        const abortClassified = classifyAdminPdfFetchAbort(parseErr, externalSignal);
+        if (abortClassified) {
+          if (abortClassified.kind === "cancelled") throw abortClassified;
+          lastErr = abortClassified;
+          if (attempt < ADMIN_PDF_CHUNK_MAX_ATTEMPTS) { await pdfSleep(attempt * 500); continue; }
+          throw lastErr;
+        }
+        lastErr = new PdfLoadError("invalid", "A part of the PDF could not be read.");
+        if (attempt < ADMIN_PDF_CHUNK_MAX_ATTEMPTS) { await pdfSleep(attempt * 500); continue; }
+        throw lastErr;
+      }
+
+      if (!payload.success) {
+        const classified = classifyAdminPdfBackendError(payload);
+        if (classified.kind === "auth" || classified.kind === "notfound") throw classified; // permanent - no point retrying
+        lastErr = classified;
+        if (attempt < ADMIN_PDF_CHUNK_MAX_ATTEMPTS) { await pdfSleep(attempt * 500); continue; }
+        throw lastErr;
+      }
+
+      if (!payload.chunkBase64) {
+        lastErr = new PdfLoadError("invalid", "A part of the PDF was empty.");
+        if (attempt < ADMIN_PDF_CHUNK_MAX_ATTEMPTS) { await pdfSleep(attempt * 500); continue; }
+        throw lastErr;
+      }
+
+      const reportedByteLength = payload.byteLength;
+      const reportedChunkIndex = payload.chunkIndex;
+
+      // Strict validation of the SERVER'S OWN reported fields, before
+      // even touching the Base64 payload - a missing/wrong/malformed
+      // field is rejected immediately, exactly like a mismatched byte
+      // count below.
+      if (!Number.isInteger(reportedChunkIndex) || reportedChunkIndex !== chunkIndex) {
+        lastErr = new PdfLoadError("invalid", "A part of the PDF arrived out of order.");
+        if (attempt < ADMIN_PDF_CHUNK_MAX_ATTEMPTS) { await pdfSleep(attempt * 500); continue; }
+        throw lastErr;
+      }
+      if (!Number.isInteger(reportedByteLength) || !Number.isFinite(reportedByteLength) || reportedByteLength < 0) {
+        lastErr = new PdfLoadError("invalid", "A part of the PDF reported an invalid size.");
+        if (attempt < ADMIN_PDF_CHUNK_MAX_ATTEMPTS) { await pdfSleep(attempt * 500); continue; }
+        throw lastErr;
+      }
+
+      // Decoded immediately and the base64 string discarded right
+      // after - this one chunk's Base64 never lingers alongside the
+      // growing final byte array.
+      const bytes = base64ToUint8ArrayChunked(payload.chunkBase64);
+      payload.chunkBase64 = null;
+      payload = null;
+
+      if (bytes.length !== reportedByteLength) {
+        lastErr = new PdfLoadError("invalid", "A part of the PDF did not match its reported size.");
+        if (attempt < ADMIN_PDF_CHUNK_MAX_ATTEMPTS) { await pdfSleep(attempt * 500); continue; }
+        throw lastErr;
+      }
+      // Exact match required either way - a short final chunk is
+      // caught right here, not left for the whole-file assembly check
+      // to discover later.
+      if (bytes.length !== expectedChunkSize) {
+        lastErr = new PdfLoadError("invalid", "A part of the PDF was an unexpected size.");
+        if (attempt < ADMIN_PDF_CHUNK_MAX_ATTEMPTS) { await pdfSleep(attempt * 500); continue; }
+        throw lastErr;
+      }
+
+      return bytes;
+    } catch (err) {
+      if (err instanceof PdfLoadError) {
+        if (err.kind === "auth" || err.kind === "notfound" || err.kind === "cancelled") throw err; // permanent
+        lastErr = err;
+        if (attempt < ADMIN_PDF_CHUNK_MAX_ATTEMPTS) { await pdfSleep(attempt * 500); continue; }
+        throw err;
+      }
+      const abortClassified = classifyAdminPdfFetchAbort(err, externalSignal);
+      if (abortClassified) {
+        if (abortClassified.kind === "cancelled") throw abortClassified; // permanent, silent
+        lastErr = abortClassified;
+        if (attempt < ADMIN_PDF_CHUNK_MAX_ATTEMPTS) { await pdfSleep(attempt * 500); continue; }
+        throw lastErr;
+      }
+      lastErr = new PdfLoadError("network", "Could not reach the server. Check your connection and try again.");
+      if (attempt < ADMIN_PDF_CHUNK_MAX_ATTEMPTS) { await pdfSleep(attempt * 500); continue; }
+      throw lastErr;
+    } finally {
+      // Same reasoning as fetchAdminPdfMeta() above - only clears the
+      // timeout/listener once this whole attempt has genuinely
+      // finished, so a cancellation during body download is caught
+      // immediately rather than only at the next between-attempts
+      // check.
+      cleanup();
+    }
+  }
+  throw lastErr || new PdfLoadError("network", "Could not load this part of the PDF.");
+}
+
+// The one shared Admin PDF byte loader - used by View PDF, Download
+// PDF, Submitted Jobs, and Weekly Itineraries alike (all four funnel
+// through this single function, so there is only one chunking/retry/
+// progress implementation to maintain). Fetches metadata once, then
+// downloads each chunk SEQUENTIALLY (deliberately conservative - no
+// concurrency - to stay gentle on Apps Script and keep behavior
+// predictable), decoding, VALIDATING, and placing each one directly
+// into the correct offset of a single pre-sized Uint8Array allocated
+// up front from the known total size. No duplicate full-size Base64
+// copy is ever held in memory, and each chunk's own Base64 is released
+// immediately after decoding (see fetchAdminPdfChunk above). Once
+// every chunk has landed, the final assembled byte count is checked
+// against the metadata's own reported size as one last consistency
+// check.
+//
+// `onProgress(bytesReceived, totalBytes)` is called after metadata
+// arrives (0, total) and after every chunk lands, so callers can show
+// real byte-based progress rather than an artificial timer.
+// `externalSignal`, if provided, is threaded through to every
+// underlying fetch (metadata AND every chunk) via createRequestSignal()
+// above - aborting it cancels whichever single request is actually in
+// flight immediately, not just at the next between-chunks check, and
+// the resulting PdfLoadError("cancelled", ...) propagates straight out
+// so no further chunks are attempted and no retry is ever triggered by
+// a cancellation.
+async function fetchAdminPdfBytesChunked(action, adminToken, submissionId, onProgress, externalSignal) {
+  const actions = ADMIN_PDF_CHUNKED_ACTIONS[action];
+  if (!actions) {
+    throw new PdfLoadError("invalid", "Unknown PDF source.");
+  }
+  if (externalSignal && externalSignal.aborted) throw new PdfLoadError("cancelled", "Cancelled.");
+
+  const meta = await fetchAdminPdfMeta(actions.meta, adminToken, submissionId, externalSignal);
+
+  const bytes = new Uint8Array(meta.size);
+  let bytesReceived = 0;
+  if (onProgress) onProgress(0, meta.size);
+
+  for (let chunkIndex = 0; chunkIndex < meta.chunkCount; chunkIndex++) {
+    const isLastChunk = chunkIndex === meta.chunkCount - 1;
+    const expectedThisChunkSize = isLastChunk ? (meta.size - chunkIndex * meta.chunkSize) : meta.chunkSize;
+    const chunkBytes = await fetchAdminPdfChunk(actions.chunk, adminToken, submissionId, chunkIndex, expectedThisChunkSize, externalSignal);
+    bytes.set(chunkBytes, chunkIndex * meta.chunkSize);
+    bytesReceived += chunkBytes.length;
+    if (onProgress) onProgress(bytesReceived, meta.size);
+  }
+
+  if (bytesReceived !== meta.size) {
+    throw new PdfLoadError("invalid", "The PDF did not download completely (received " + bytesReceived + " of " + meta.size + " bytes).");
+  }
+
+  return { bytes, filename: meta.filename };
 }
 
 function pdfLoadErrorMessage(err) {
   const kind = err && err.kind;
   if (kind === "auth") return "You're not authorized to view this PDF. Please log in again.";
   if (kind === "notfound") return "That PDF could not be found. It may have been deleted.";
-  if (kind === "timeout") return "The request timed out. Check your connection and try again.";
+  // A server/request timeout is not necessarily an internet problem -
+  // only genuine "network" errors below tell the admin to check their
+  // connection.
+  if (kind === "timeout") return "The PDF is taking longer than expected to load. Please try again.";
   if (kind === "invalid") return "The server's response could not be read. Please try again.";
   if (kind === "network") return "Could not reach the server. Check your connection and try again.";
   if (kind === "backend") return err.message || "The server reported an error.";
@@ -2181,6 +2480,16 @@ async function showAdminPdfDocument(action, adminToken, submissionId, opts) {
   let pdfDoc = null;
   let currentPage = 1;
   let closed = false;
+  // Real cancellation for the Admin PDF fetch itself - closing the
+  // viewer aborts whichever single metadata/chunk request is currently
+  // in flight immediately (not just "stop starting new ones at the
+  // next between-chunks check"), and the resulting PdfLoadError with
+  // kind "cancelled" is treated as permanent everywhere in the
+  // chunk/metadata retry logic, so a cancellation can never trigger a
+  // retry. Entirely separate from currentRenderTask below, which
+  // cancels PDF.js's own in-flight page render - the two are
+  // independent and this never interferes with that.
+  const fetchAbortController = new AbortController();
   // Safe rendering lock: true for the entire span from "a render just
   // started" to "that render (or its cleanup/error handling) finished" -
   // this is what actually stops a rapid double-tap on Previous/Next
@@ -2198,6 +2507,12 @@ async function showAdminPdfDocument(action, adminToken, submissionId, opts) {
   // every page and keep every canvas" approach did.
   function cleanup() {
     closed = true;
+    // Aborts the currently outstanding Admin PDF network request (if
+    // any) right away - fetchAdminPdfBytesChunked() and everything it
+    // calls thread this same signal all the way down to the actual
+    // fetch() calls, so this is a real cancellation of the in-flight
+    // request, not just a flag checked between chunks.
+    fetchAbortController.abort();
     if (currentRenderTask) {
       // Cancel BEFORE resetting canvas dimensions below - PDF.js's
       // cancel() makes its .promise reject with a
@@ -2317,11 +2632,22 @@ async function showAdminPdfDocument(action, adminToken, submissionId, opts) {
   });
 
   try {
-    const [pdfjsLib, fetched] = await Promise.all([
-      loadPdfJs(),
-      fetchAdminPdfBytes(action, adminToken, submissionId)
-    ]);
+    const pdfjsLibPromise = loadPdfJs();
+    const fetched = await fetchAdminPdfBytesChunked(
+      action, adminToken, submissionId,
+      (received, total) => {
+        // Real byte-based progress, not an artificial timer - reflects
+        // bytes actually received from the chunked backend so far.
+        if (closed) return;
+        const pct = total > 0 ? Math.floor((received / total) * 100) : 0;
+        statusArea.textContent = "Loading PDF\u2026 " + pct + "%";
+      },
+      fetchAbortController.signal // real cancellation - aborts the in-flight request immediately when the viewer is closed
+    );
     if (closed) return; // admin closed the viewer while this was still loading
+
+    const pdfjsLib = await pdfjsLibPromise;
+    if (closed) return;
 
     const loadingTask = pdfjsLib.getDocument({ data: fetched.bytes });
     pdfDoc = await loadingTask.promise;
@@ -2333,8 +2659,39 @@ async function showAdminPdfDocument(action, adminToken, submissionId, opts) {
     currentPage = 1;
     await renderPage(currentPage);
   } catch (err) {
+    // A cancellation (the admin closed the viewer) must be completely
+    // silent - never shown as an error, and closed is already true by
+    // the time this runs (cleanup() sets it before aborting), so the
+    // existing "!closed" guard below already suppresses showError()
+    // for it; the explicit "cancelled" kind check here is what stops
+    // the chunk/metadata retry loops from ever attempting a retry in
+    // response to a cancellation in the first place (see
+    // fetchAdminPdfChunk/fetchAdminPdfMeta above).
+    if (err && err.kind === "cancelled") return;
     console.error(err);
     if (!closed) showError(pdfLoadErrorMessage(err));
+  }
+}
+
+// Shared Download PDF handler for both Submitted Jobs and Weekly
+// Itineraries - uses the SAME chunked backend/loader as View PDF
+// above, reconstructs the whole PDF in memory, creates a temporary
+// Blob, downloads it under its real archived filename via the
+// existing downloadBlob() helper (which already revokes its own Blob
+// URL after a short delay), then never touches that Blob again. Never
+// opens, reveals, or requires access to Google Drive - the PDF only
+// ever exists in the browser as this one temporary Blob for the
+// download.
+async function downloadAdminPdf(action, adminToken, submissionId, fallbackFilename) {
+  toast("Preparing download\u2026");
+  try {
+    const fetched = await fetchAdminPdfBytesChunked(action, adminToken, submissionId, null, null);
+    if (!fetched) return;
+    const blob = new Blob([fetched.bytes], { type: "application/pdf" });
+    downloadBlob(blob, fetched.filename || fallbackFilename || "document.pdf");
+  } catch (err) {
+    console.error(err);
+    toast(pdfLoadErrorMessage(err), "error");
   }
 }
 
@@ -2501,9 +2858,13 @@ async function doSubmit(job, schema) {
     let blob;
     try {
       const images = collectJobPdfImages(job);
-      const largeMode = isLargePhotoJob(job);
+      const profile = getPhotoCompressionProfile(job);
+      const largeMode = profile !== null;
+      const settings = profile ? PHOTO_COMPRESSION_PROFILES[profile] : null;
       blob = await buildJobPdfBlob(job, schema, {
         largePhotoMode: largeMode,
+        photoMaxDim: settings ? settings.maxDim : undefined,
+        photoQuality: settings ? settings.quality : undefined,
         totalImageCount: images.length,
         onProgress: largeMode ? (cur, total) => overlay.updateProgress(cur, total) : null
       });
@@ -3087,6 +3448,7 @@ async function renderAdminDashboard() {
         el("td", {}, r.designerEmail || "\u2014"),
         el("td", {}, [
           el("button", { class: "btn btn-ghost", onclick: () => viewSubmittedPdf(r) }, "View PDF"),
+          el("button", { class: "btn btn-ghost", onclick: () => downloadAdminPdf("getSubmissionPdf", getAdminToken(), r.submissionId, r.pdfFilename) }, "Download PDF"),
           el("button", { class: "btn btn-ghost itinerary-admin-delete-btn", onclick: () => confirmDeleteSubmission(r) }, "Delete")
         ])
       ]));
@@ -3193,3 +3555,4 @@ document.addEventListener("DOMContentLoaded", async () => {
     renderAccessTypeScreen();
   }
 });
+
