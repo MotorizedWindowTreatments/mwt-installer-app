@@ -1591,6 +1591,43 @@ function validateRequired(job, schema) {
       }
     });
   });
+  // Required line-item columns (e.g. Control Side / IB-OB-Ceiling on
+  // Blinds & Shades) - same "required: true" convention as the section
+  // fields above, extended to schema.lineItems.columns. Only columns
+  // explicitly marked required are checked, against every existing line
+  // item, so a form with no required columns costs nothing extra here.
+  // This only ever runs where validateRequired() already ran (Submit &
+  // Send) - Save/autosave never call this function, so drafts remain
+  // fully allowed to have incomplete line items.
+  const lineItemColumns = (schema.lineItems && schema.lineItems.columns) || [];
+  const requiredColumns = lineItemColumns.filter((c) => c.required);
+  if (requiredColumns.length) {
+    (job.lineItems || []).forEach((row, idx) => {
+      requiredColumns.forEach((c) => {
+        const value = (row[c.id] || "").toString().trim();
+        // A required select column (e.g. Control Side, IB / OB /
+        // Ceiling) is only satisfied by an EXACT match against one of
+        // its own options - not merely "non-empty". This matters
+        // specifically for backward compatibility: the old Blinds &
+        // Shades "controls" field used to be free text, so an existing
+        // saved job can still have a legacy value like "Tilt Left"
+        // sitting in row.controls. That value is non-empty but isn't
+        // one of the new R/L/RL choices, so the renderer already shows
+        // the dropdown as unselected for it - validation must agree
+        // with what's visibly selected, or Submit & Send could succeed
+        // without the installer ever having picked a valid option. The
+        // stored legacy value itself is never touched here - only
+        // read - so the job still opens and saves as a draft normally
+        // until the installer explicitly changes the field.
+        const isValid = c.type === "select" && Array.isArray(c.options)
+          ? c.options.indexOf(row[c.id]) !== -1
+          : !!value;
+        if (!isValid) {
+          missing.push("Line " + (idx + 1) + ": " + c.label);
+        }
+      });
+    });
+  }
   return missing;
 }
 
@@ -3555,4 +3592,3 @@ document.addEventListener("DOMContentLoaded", async () => {
     renderAccessTypeScreen();
   }
 });
-
