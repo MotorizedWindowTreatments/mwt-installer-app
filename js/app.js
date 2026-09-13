@@ -3565,53 +3565,97 @@ async function renderAdminDashboard() {
 
   content.appendChild(wrap);
 
+  // Guards against overlapping Submitted Jobs requests - Search (and
+  // the form-type "change" handler, which also calls doSearch(), plus
+  // the pager's Prev/Next buttons below) can otherwise fire more than
+  // one request that races to control the SAME resultsBox. Only one
+  // request is ever allowed to be in flight at a time; a new call
+  // while one is already running simply does nothing.
+  let submittedJobsLoadInFlight = false;
+
   async function loadAndRenderResults() {
-    resultsBox.innerHTML = "";
-    if (!navigator.onLine) {
-      resultsBox.appendChild(el("div", { class: "needs-review-banner" }, "No internet connection. Submitted Jobs requires an internet connection to load - please reconnect and search again."));
-      return;
-    }
-    resultsBox.appendChild(el("div", { class: "help-text" }, "Loading\u2026"));
+    if (submittedJobsLoadInFlight) return;
+    submittedJobsLoadInFlight = true;
+    searchBtn.disabled = true;
 
-    const bodyObj = {
-      action: "listSubmissions",
-      adminToken: getAdminToken(),
-      page: adminState.page,
-      pageSize: adminState.pageSize,
-      designFirm: adminState.designFirm,
-      sidemark: adminState.sidemark,
-      projectNumber: adminState.projectNumber,
-      formType: adminState.formType
-    };
-
-    // Bounded timeout + transient retry (up to 3 total attempts) -
-    // network failures, timeouts, HTTP 408/429/5xx, and unreadable/
-    // non-JSON responses are retried; a genuine parsed backend
-    // response (success or a real error) resolves on the first attempt
-    // and is never retried. Filters, pagination, and table rendering
-    // below are all unchanged.
-    let payload;
     try {
-      payload = await postToBackendWithRetry(bodyObj);
-    } catch (err) {
       resultsBox.innerHTML = "";
-      resultsBox.appendChild(el("div", { class: "needs-review-banner" },
-        err && err.transient
-          ? "The server is temporarily not responding. Please try again."
-          : "Could not reach the server. Check your connection and try again."
-      ));
-      return;
-    }
+      if (!navigator.onLine) {
+        resultsBox.appendChild(el("div", { class: "needs-review-banner" }, "No internet connection. Submitted Jobs requires an internet connection to load - please reconnect and search again."));
+        return;
+      }
+      resultsBox.appendChild(el("div", { class: "help-text" }, "Loading\u2026"));
 
-    resultsBox.innerHTML = "";
-    if (!payload || !payload.success) {
-      resultsBox.appendChild(el("div", { class: "needs-review-banner" }, (payload && payload.error) ? payload.error : "Could not load submitted jobs."));
-      return;
-    }
+      const bodyObj = {
+        action: "listSubmissions",
+        adminToken: getAdminToken(),
+        page: adminState.page,
+        pageSize: adminState.pageSize,
+        designFirm: adminState.designFirm,
+        sidemark: adminState.sidemark,
+        projectNumber: adminState.projectNumber,
+        formType: adminState.formType
+      };
 
-    adminState.rows = payload.rows || [];
-    adminState.total = payload.total || 0;
-    renderResultsTable(resultsBox);
+      // Submitted Jobs gets its OWN dedicated request budget here -
+      // NOT the shared 12-second default (which is still used exactly
+      // as before by Administrator Login, and the shared 60-second
+      // Submit & Send/Resend call is also unaffected) - a real listing
+      // request can genuinely take longer than 12 seconds, and is
+      // deliberately bounded to just 2 total attempts (rather than 3)
+      // since each attempt already gets a full 60 seconds. The
+      // underlying transient-vs-permanent classification (network
+      // failure / timeout / HTTP 408,429,5xx / unreadable response vs
+      // a genuine parsed backend result) is the SAME shared logic used
+      // everywhere else - only these two options differ for this one
+      // call site.
+      let payload;
+      try {
+        payload = await postToBackendWithRetry(bodyObj, { maxAttempts: 2, timeoutMs: 60000 });
+      } catch (err) {
+        resultsBox.innerHTML = "";
+        resultsBox.appendChild(el("div", { class: "needs-review-banner" },
+          err && err.transient
+            ? "The server is temporarily not responding. Please try again."
+            : "Could not reach the server. Check your connection and try again."
+        ));
+        return;
+      }
+
+      resultsBox.innerHTML = "";
+      if (!payload || !payload.success) {
+        resultsBox.appendChild(el("div", { class: "needs-review-banner" }, (payload && payload.error) ? payload.error : "Could not load submitted jobs."));
+        return;
+      }
+
+      // A successful response must still have a genuinely usable rows
+      // array before anything downstream (renderResultsTable, which
+      // calls .forEach on it) ever touches it - an unexpected shape
+      // here must be a visible error, never a silent blank screen.
+      if (!Array.isArray(payload.rows)) {
+        resultsBox.appendChild(el("div", { class: "needs-review-banner" }, "The server returned submitted jobs in an unexpected format. Please try again."));
+        return;
+      }
+
+      adminState.rows = payload.rows;
+      adminState.total = payload.total || 0;
+
+      // renderResultsTable() clears and rebuilds resultsBox itself - if
+      // it throws partway through for any unexpected reason, the box
+      // would otherwise be left cleared with nothing re-added (exactly
+      // the reported blank-screen symptom). Catching it here guarantees
+      // a visible message instead.
+      try {
+        renderResultsTable(resultsBox);
+      } catch (renderErr) {
+        console.error("renderResultsTable failed:", renderErr);
+        resultsBox.innerHTML = "";
+        resultsBox.appendChild(el("div", { class: "needs-review-banner" }, "Submitted jobs were received but could not be displayed. Please refresh and try again."));
+      }
+    } finally {
+      submittedJobsLoadInFlight = false;
+      searchBtn.disabled = false;
+    }
   }
 
   function renderResultsTable(box) {
