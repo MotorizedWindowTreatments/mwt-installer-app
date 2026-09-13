@@ -164,6 +164,7 @@ const FORM_DRAPERY = {
   sections: [MWT_HEADER_TECH, MWT_INSTALLER_NOTES_DRAPERY, MWT_SOLD_TO_BILL_TO, MWT_PROJECT_INFO],
   lineItems: {
     title: "Line Items",
+    hasPhotoColumn: true,
     columns: [
       { id: "room", label: "Room", hint: "MBR, LR, DR, BR1..." },
       { id: "quantity", label: "Quantity" },
