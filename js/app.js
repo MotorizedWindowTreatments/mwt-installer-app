@@ -3668,6 +3668,19 @@ async function renderAdminDashboard() {
       return;
     }
 
+    // Backend Sheet values can legitimately come back as numbers (e.g.
+    // a numeric Project #) rather than strings - the shared el()
+    // helper only converts STRING children into real text nodes (see
+    // its own typeof check), so passing a raw number straight through
+    // as a child throws inside appendChild(). This local helper safely
+    // converts any backend row value into a displayable string (or the
+    // existing "\u2014" placeholder for a missing value) before it
+    // ever reaches el() - el() itself is untouched.
+    function displayValue(value) {
+      if (value === null || value === undefined || value === "") return "\u2014";
+      return String(value);
+    }
+
     const table = el("table", { class: "job-table" });
     table.appendChild(el("thead", {}, el("tr", {}, [
       el("th", {}, "Submitted"), el("th", {}, "Design Firm"), el("th", {}, "Sidemark"),
@@ -3675,13 +3688,31 @@ async function renderAdminDashboard() {
     ])));
     const tbody = el("tbody", {});
     adminState.rows.forEach((r) => {
+      // fmtTime() already returns a string for any input, including an
+      // unparseable one (new Date(x).toLocaleString() renders as the
+      // string "Invalid Date" rather than throwing), so it does not
+      // itself need to change to stay safe - and converting its input
+      // to a string BEFORE calling it would risk breaking a
+      // legitimately numeric epoch-millis timestamp (new Date(number)
+      // parses correctly; new Date(String(number)) generally does
+      // not), which would change the visible date format for valid
+      // data. This try/catch is kept purely as a genuine
+      // belt-and-suspenders guard around the call site for any
+      // truly unanticipated failure, without altering fmtTime() itself
+      // or how any valid timestamp displays.
+      let submittedDisplay;
+      try {
+        submittedDisplay = fmtTime(r.timestamp);
+      } catch (e) {
+        submittedDisplay = "";
+      }
       tbody.appendChild(el("tr", {}, [
-        el("td", {}, fmtTime(r.timestamp)),
-        el("td", {}, r.designFirm || "\u2014"),
-        el("td", {}, r.sidemark || "\u2014"),
-        el("td", {}, r.projectNumber || "\u2014"),
-        el("td", {}, r.formType || "\u2014"),
-        el("td", {}, r.designerEmail || "\u2014"),
+        el("td", {}, submittedDisplay),
+        el("td", {}, displayValue(r.designFirm)),
+        el("td", {}, displayValue(r.sidemark)),
+        el("td", {}, displayValue(r.projectNumber)),
+        el("td", {}, displayValue(r.formType)),
+        el("td", {}, displayValue(r.designerEmail)),
         el("td", {}, [
           el("button", { class: "btn btn-ghost", onclick: () => viewSubmittedPdf(r) }, "View PDF"),
           el("button", { class: "btn btn-ghost", onclick: () => downloadAdminPdf("getSubmissionPdf", getAdminToken(), r.submissionId, r.pdfFilename) }, "Download PDF"),
