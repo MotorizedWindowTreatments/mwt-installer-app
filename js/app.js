@@ -2077,6 +2077,95 @@ function pdfSleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+// ---------------------------------------------------------------
+// Shared bounded-timeout / transient-retry POST helper - used by
+// Administrator Login, Submitted Jobs, and Submit & Send/Resend below.
+// Never retries a genuine, successfully-parsed backend response (an
+// application/auth-level result, whether success or a real error like
+// "Incorrect password.") - only network failures, request timeouts,
+// unreadable/non-JSON responses, and HTTP 408/429/5xx are treated as
+// transient and eligible for a bounded retry. This is what prevents a
+// real incorrect-password response from ever being retried (which
+// could otherwise consume additional password attempts), while still
+// giving genuinely transient failures a real chance to recover.
+// ---------------------------------------------------------------
+function isTransientHttpStatus(status) {
+  return status === 408 || status === 429 || (status >= 500 && status < 600);
+}
+
+// One POST attempt. Resolves with the parsed JSON payload whenever the
+// HTTP response was OK and its body parsed as JSON - this is ALWAYS
+// the final result (never retried by the wrapper below), regardless of
+// whether payload.success is true or false. Throws a classified error
+// (err.transient === true/false) for everything else.
+async function postToBackendOnce(bodyObj, timeoutMs) {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const resp = await fetch(MWT_CONFIG.submitApiUrl, {
+      method: "POST",
+      headers: { "Content-Type": "text/plain;charset=utf-8" },
+      body: JSON.stringify(bodyObj),
+      signal: controller.signal
+    });
+
+    if (!resp.ok) {
+      const err = new Error("Server returned status " + resp.status);
+      err.transient = isTransientHttpStatus(resp.status);
+      err.httpStatus = resp.status;
+      throw err;
+    }
+
+    try {
+      return await resp.json();
+    } catch (parseErr) {
+      // An unreadable/non-JSON response on an otherwise-OK status can
+      // never be a genuine, readable application error - there is
+      // nothing to read - so it must always be treated as transient,
+      // never shown as a real backend rejection.
+      const err = new Error("The server's response could not be read.");
+      err.transient = true;
+      throw err;
+    }
+  } catch (err) {
+    if (err && typeof err.transient === "boolean") throw err; // already classified above
+    if (err && err.name === "AbortError") {
+      const timeoutErr = new Error("The request timed out.");
+      timeoutErr.transient = true;
+      throw timeoutErr;
+    }
+    const netErr = new Error("A network error occurred.");
+    netErr.transient = true;
+    throw netErr;
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
+// Bounded transient retry - up to opts.maxAttempts (default 3) total
+// attempts, a short bounded delay between them, ONLY retrying when
+// postToBackendOnce() classified the failure as transient. `bodyObj`
+// is sent UNCHANGED on every attempt - callers that need idempotent
+// retries (Submit & Send) build it once, before the first attempt, and
+// never reconstruct it between retries.
+async function postToBackendWithRetry(bodyObj, opts) {
+  opts = opts || {};
+  const maxAttempts = opts.maxAttempts || 3;
+  const timeoutMs = opts.timeoutMs || 12000;
+  const retryDelayMs = opts.retryDelayMs || 700;
+  let lastErr = null;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      return await postToBackendOnce(bodyObj, timeoutMs);
+    } catch (err) {
+      lastErr = err;
+      if (!err.transient || attempt >= maxAttempts) throw err;
+      await pdfSleep(retryDelayMs * attempt);
+    }
+  }
+  throw lastErr;
+}
+
 // Decodes a base64 string into a Uint8Array without ever materializing
 // one full-size intermediate binary string for the whole file at once
 // (which is what plain atob(base64) on the entire string does). Instead
@@ -2960,7 +3049,17 @@ async function doSubmit(job, schema) {
       // app never sends a recipient list. The three fixed company
       // addresses are hard-coded server-side and cannot be changed or
       // seen from here.
-      const payloadBody = JSON.stringify({
+      //
+      // bodyObj is built ONCE, here, before any network attempt - every
+      // retry below (via postToBackendWithRetry) sends this EXACT SAME
+      // object, so submissionIdForRequest (and therefore
+      // pendingResubmissionId for a resend) is guaranteed identical
+      // across every attempt of this one submission. This is what keeps
+      // retries idempotent: if an earlier attempt actually succeeded
+      // server-side but its response was lost, a retry with the SAME id
+      // lets the backend's existing alreadyProcessed protection answer
+      // safely instead of sending a second email.
+      const bodyObj = {
         action: "submit",
         installerToken: getDeviceToken(),
         submissionId: submissionIdForRequest,
@@ -2973,18 +3072,34 @@ async function doSubmit(job, schema) {
         projectNumber: job.projectNumber || "",
         designerEmail,
         pdfBase64: base64Pdf
-      });
+      };
 
-      const resp = await fetch(MWT_CONFIG.submitApiUrl, {
-        method: "POST",
-        headers: { "Content-Type": "text/plain;charset=utf-8" },
-        body: payloadBody
-      });
+      // Bounded timeout + transient retry (up to 3 total attempts,
+      // network failures / timeouts / HTTP 408,429,5xx / unreadable
+      // responses only) - a genuine parsed backend response (success or
+      // a real application error) resolves on the first attempt and is
+      // never retried. A longer timeout than the shared default is used
+      // here since this request carries the PDF itself.
+      let payload;
+      try {
+        payload = await postToBackendWithRetry(bodyObj, { timeoutMs: 60000 });
+      } catch (err) {
+        // Every attempt failed (or a non-transient failure occurred) -
+        // the job stays saved, is NOT marked submitted, and for a
+        // resend pendingResubmissionId is left completely untouched, so
+        // a later manual retry (Submit & Send / Resend Updated Job
+        // again) reuses the exact same id rather than minting a new one.
+        console.error("Submit & Send failed:", err);
+        toast(
+          err && err.transient
+            ? "The server is temporarily not responding. Your job is still saved. Please try again."
+            : "Submission could not be emailed. Your job is still saved. Please try again.",
+          "error"
+        );
+        return;
+      }
 
-      let payload = null;
-      try { payload = await resp.json(); } catch (parseErr) { /* non-JSON error response, handled below */ }
-
-      if (resp.ok && payload && payload.success) {
+      if (payload && payload.success) {
         if (isResend) {
           // The resend is now confirmed successful - the new id becomes
           // the job's current submissionId, and the temporary pending
@@ -3015,7 +3130,7 @@ async function doSubmit(job, schema) {
         // For a resend, pendingResubmissionId is deliberately left set,
         // so that retry reuses the exact same id rather than minting a
         // new one.
-        const errMsg = (payload && payload.error) ? payload.error : ("Server returned status " + resp.status);
+        const errMsg = (payload && payload.error) ? payload.error : "The server reported an error.";
         console.error("Submit & Send failed:", errMsg);
         toast("Submission could not be emailed. Your job is still saved. Please try again.", "error");
       }
@@ -3229,15 +3344,47 @@ function renderAuthScreen(role) {
       const bodyObj = isAdmin
         ? { action: "authorizeAdmin", password: value }
         : { action: "authorizeInstaller", pin: value };
-      const resp = await fetch(MWT_CONFIG.submitApiUrl, {
-        method: "POST",
-        headers: { "Content-Type": "text/plain;charset=utf-8" },
-        body: JSON.stringify(bodyObj)
-      });
-      let payload = null;
-      try { payload = await resp.json(); } catch (parseErr) { /* handled below */ }
 
-      if (resp.ok && payload && payload.success && payload.token) {
+      let payload = null;
+      let requestOk = false;
+      if (isAdmin) {
+        // Administrator Login: bounded timeout + transient retry (up to
+        // 3 total attempts) - network failures, timeouts, HTTP
+        // 408/429/5xx, and unreadable/non-JSON responses are retried;
+        // a genuine parsed backend response - correct password OR a
+        // real "Incorrect password." - resolves on the very first
+        // attempt and is never retried, so a real wrong password can
+        // never be silently re-attempted. Installer PIN authorization
+        // below is completely unchanged.
+        try {
+          payload = await postToBackendWithRetry(bodyObj);
+          // postToBackendOnce() only ever returns a payload here after a
+          // genuinely OK (2xx) HTTP response - any non-OK status is
+          // thrown instead (see its own !resp.ok branch) - so a
+          // successful return already implies requestOk.
+          requestOk = true;
+        } catch (err) {
+          errorBox.textContent = err && err.transient
+            ? "The server did not respond correctly. Please try again."
+            : "Could not reach the server. Check your connection and try again.";
+          input.value = "";
+          input.focus();
+          return;
+        }
+      } else {
+        // Installer PIN authorization - completely unchanged: a single
+        // request, no timeout, no retry, and the SAME resp.ok
+        // requirement as before this whole reliability change.
+        const resp = await fetch(MWT_CONFIG.submitApiUrl, {
+          method: "POST",
+          headers: { "Content-Type": "text/plain;charset=utf-8" },
+          body: JSON.stringify(bodyObj)
+        });
+        requestOk = resp.ok;
+        try { payload = await resp.json(); } catch (parseErr) { /* handled below */ }
+      }
+
+      if (requestOk && payload && payload.success && payload.token) {
         if (isAdmin) setAdminToken(payload.token);
         else setDeviceToken(payload.token);
 
@@ -3426,37 +3573,45 @@ async function renderAdminDashboard() {
     }
     resultsBox.appendChild(el("div", { class: "help-text" }, "Loading\u2026"));
 
+    const bodyObj = {
+      action: "listSubmissions",
+      adminToken: getAdminToken(),
+      page: adminState.page,
+      pageSize: adminState.pageSize,
+      designFirm: adminState.designFirm,
+      sidemark: adminState.sidemark,
+      projectNumber: adminState.projectNumber,
+      formType: adminState.formType
+    };
+
+    // Bounded timeout + transient retry (up to 3 total attempts) -
+    // network failures, timeouts, HTTP 408/429/5xx, and unreadable/
+    // non-JSON responses are retried; a genuine parsed backend
+    // response (success or a real error) resolves on the first attempt
+    // and is never retried. Filters, pagination, and table rendering
+    // below are all unchanged.
+    let payload;
     try {
-      const resp = await fetch(MWT_CONFIG.submitApiUrl, {
-        method: "POST",
-        headers: { "Content-Type": "text/plain;charset=utf-8" },
-        body: JSON.stringify({
-          action: "listSubmissions",
-          adminToken: getAdminToken(),
-          page: adminState.page,
-          pageSize: adminState.pageSize,
-          designFirm: adminState.designFirm,
-          sidemark: adminState.sidemark,
-          projectNumber: adminState.projectNumber,
-          formType: adminState.formType
-        })
-      });
-      let payload = null;
-      try { payload = await resp.json(); } catch (e) { /* handled below */ }
-
-      resultsBox.innerHTML = "";
-      if (!resp.ok || !payload || !payload.success) {
-        resultsBox.appendChild(el("div", { class: "needs-review-banner" }, (payload && payload.error) ? payload.error : "Could not load submitted jobs."));
-        return;
-      }
-
-      adminState.rows = payload.rows || [];
-      adminState.total = payload.total || 0;
-      renderResultsTable(resultsBox);
+      payload = await postToBackendWithRetry(bodyObj);
     } catch (err) {
       resultsBox.innerHTML = "";
-      resultsBox.appendChild(el("div", { class: "needs-review-banner" }, "Could not reach the server. Check your connection and try again."));
+      resultsBox.appendChild(el("div", { class: "needs-review-banner" },
+        err && err.transient
+          ? "The server is temporarily not responding. Please try again."
+          : "Could not reach the server. Check your connection and try again."
+      ));
+      return;
     }
+
+    resultsBox.innerHTML = "";
+    if (!payload || !payload.success) {
+      resultsBox.appendChild(el("div", { class: "needs-review-banner" }, (payload && payload.error) ? payload.error : "Could not load submitted jobs."));
+      return;
+    }
+
+    adminState.rows = payload.rows || [];
+    adminState.total = payload.total || 0;
+    renderResultsTable(resultsBox);
   }
 
   function renderResultsTable(box) {
