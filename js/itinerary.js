@@ -318,6 +318,31 @@ function itnComputeDayHours(day) {
   return { hours: (finishMin - startMin) / 60, error: null };
 }
 
+// Sanitizes free-typed input for the three Weekly Itinerary currency
+// fields (Tolls, Parking/Fuel, Material Purchases). These fields are
+// type="text" rather than type="number" because iOS shows a comma
+// decimal key for some locales, and a native number input does not
+// reliably accept a comma - this does the validation/restriction work
+// a number input would normally do natively: digits only, at most ONE
+// decimal separator (accepting either "." or "," as typed, always
+// normalized to "." for storage), and at most 2 digits after it. Never
+// a negative sign, never letters, never more than one decimal point.
+// The returned string is both what's redisplayed in the field and what
+// gets stored on the day object, so every existing parseFloat() call
+// site (totals, PDF, summary, Submit & Send) keeps working unchanged.
+function itnSanitizeCurrencyInput(raw) {
+  if (!raw) return "";
+  let v = raw.replace(",", ".");
+  v = v.replace(/[^0-9.]/g, "");
+  const firstDot = v.indexOf(".");
+  if (firstDot !== -1) {
+    v = v.slice(0, firstDot + 1) + v.slice(firstDot + 1).replace(/\./g, "");
+    const [whole, frac] = v.split(".");
+    v = whole + "." + frac.slice(0, 2);
+  }
+  return v;
+}
+
 function itnComputeDayMiles(day) {
   const start = parseFloat(day.startMileage);
   const end = parseFloat(day.endMileage);
@@ -708,24 +733,38 @@ function renderItineraryDayCard(itinerary, dayKey) {
   mileGrid.appendChild(el("label", { class: "itinerary-field" }, [
     "Tolls ($)",
     el("input", {
-      type: "number", inputmode: "decimal", min: "0", step: "0.01", value: day.tolls,
-      oninput: (e) => { day.tolls = e.target.value; scheduleItineraryAutosave(itinerary); refreshItineraryLiveDisplays(itinerary); }
+      type: "text", inputmode: "decimal", value: day.tolls,
+      oninput: (e) => {
+        const sanitized = itnSanitizeCurrencyInput(e.target.value);
+        if (e.target.value !== sanitized) e.target.value = sanitized;
+        day.tolls = sanitized;
+        scheduleItineraryAutosave(itinerary);
+        refreshItineraryLiveDisplays(itinerary);
+      }
     })
   ]));
   mileGrid.appendChild(el("label", { class: "itinerary-field" }, [
     "Parking / Fuel ($)",
     el("input", {
-      type: "number", inputmode: "decimal", min: "0", step: "0.01", value: day.parkingFuel,
-      oninput: (e) => { day.parkingFuel = e.target.value; scheduleItineraryAutosave(itinerary); refreshItineraryLiveDisplays(itinerary); }
+      type: "text", inputmode: "decimal", value: day.parkingFuel,
+      oninput: (e) => {
+        const sanitized = itnSanitizeCurrencyInput(e.target.value);
+        if (e.target.value !== sanitized) e.target.value = sanitized;
+        day.parkingFuel = sanitized;
+        scheduleItineraryAutosave(itinerary);
+        refreshItineraryLiveDisplays(itinerary);
+      }
     })
   ]));
 
   mileGrid.appendChild(el("label", { class: "itinerary-field" }, [
     "Material Purchases ($)",
     el("input", {
-      type: "number", inputmode: "decimal", min: "0", step: "0.01", value: day.materialPurchases,
+      type: "text", inputmode: "decimal", value: day.materialPurchases,
       oninput: (e) => {
-        day.materialPurchases = e.target.value;
+        const sanitized = itnSanitizeCurrencyInput(e.target.value);
+        if (e.target.value !== sanitized) e.target.value = sanitized;
+        day.materialPurchases = sanitized;
         scheduleItineraryAutosave(itinerary);
         // Also updates the receipt reminder (visible only when an
         // amount is entered but no receipt photo has been attached yet
