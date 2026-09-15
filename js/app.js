@@ -97,12 +97,35 @@ function makeBlankRow(columns) {
 }
 
 function computeDisplayName(job) {
-  if (job.manualName && job.manualName.trim()) return job.manualName.trim();
   const f = job.fields || {};
   const end = f.contact || f.endUserFirstLast || "";
   const firm = f.designFirm || "";
   const sidemark = f.sidemark || "";
-  const projNum = job.projectNumber ? "MWT " + job.projectNumber : "";
+
+  // Normalizes job.projectNumber into its final "MWT ..." prefix form.
+  // If the installer already typed "MWT" (with or without a following
+  // space/dash) into the Project # field itself, that leading "MWT" is
+  // stripped first so the prefix is never doubled into "MWT MWT
+  // 23778m". If the field is literally just "MWT" with nothing else,
+  // it's left as-is rather than re-adding another "MWT ".
+  let projNum = "";
+  if (job.projectNumber) {
+    const raw = String(job.projectNumber).trim();
+    const stripped = raw.replace(/^mwt\s*-?\s*/i, "").trim();
+    projNum = stripped ? "MWT " + stripped : raw;
+  }
+
+  if (job.manualName && job.manualName.trim()) {
+    const manual = job.manualName.trim();
+    // No project number: preserve the exact previous behavior - the
+    // manual Job Name alone, untouched.
+    if (!projNum) return manual;
+    // Don't prepend the prefix again if the manual name already starts
+    // with this exact "MWT 23778m" prefix (case-insensitive).
+    if (manual.toLowerCase().startsWith(projNum.toLowerCase())) return manual;
+    return projNum + " \u2013 " + manual;
+  }
+
   // Order: Design Firm first, then Sidemark (falling back to end-user
   // contact name if no sidemark) - e.g. "MWT \u2013 Kandl", never reversed.
   const parts = [];
