@@ -140,7 +140,9 @@ function blankItineraryDay() {
     startMileage: "",
     endMileage: "",
     tolls: "",
-    parkingFuel: ""
+    parkingFuel: "",
+    materialPurchases: "",
+    receiptPhotos: []
   };
 }
 
@@ -337,7 +339,7 @@ function itnWorkPerformedCategory(value) {
 function computeItineraryTotals(itinerary) {
   const totals = {
     totalHours: 0, installs: 0, measures: 0, cutDownRetrofits: 0, serviceCalls: 0,
-    totalMiles: 0, mileageReimbursement: 0, parkingFuel: 0, tolls: 0, totalReimbursable: 0
+    totalMiles: 0, mileageReimbursement: 0, parkingFuel: 0, tolls: 0, materialPurchases: 0, totalReimbursable: 0
   };
   ITINERARY_DAY_KEYS.forEach((k) => {
     const day = itinerary.days[k];
@@ -347,13 +349,14 @@ function computeItineraryTotals(itinerary) {
     if (!m.error) totals.totalMiles += m.miles;
     totals.parkingFuel += parseFloat(day.parkingFuel) || 0;
     totals.tolls += parseFloat(day.tolls) || 0;
+    totals.materialPurchases += parseFloat(day.materialPurchases) || 0;
     (day.jobs || []).forEach((j) => {
       const cat = itnWorkPerformedCategory(j.workPerformed);
       if (cat) totals[cat] += 1;
     });
   });
   totals.mileageReimbursement = totals.totalMiles * 0.3;
-  totals.totalReimbursable = totals.mileageReimbursement + totals.parkingFuel + totals.tolls;
+  totals.totalReimbursable = totals.mileageReimbursement + totals.parkingFuel + totals.tolls + totals.materialPurchases;
   return totals;
 }
 
@@ -716,6 +719,46 @@ function renderItineraryDayCard(itinerary, dayKey) {
       oninput: (e) => { day.parkingFuel = e.target.value; scheduleItineraryAutosave(itinerary); refreshItineraryLiveDisplays(itinerary); }
     })
   ]));
+
+  mileGrid.appendChild(el("label", { class: "itinerary-field" }, [
+    "Material Purchases ($)",
+    el("input", {
+      type: "number", inputmode: "decimal", min: "0", step: "0.01", value: day.materialPurchases,
+      oninput: (e) => {
+        day.materialPurchases = e.target.value;
+        scheduleItineraryAutosave(itinerary);
+        // Also updates the receipt reminder (visible only when an
+        // amount is entered but no receipt photo has been attached yet
+        // for this day) - see refreshItineraryLiveDisplays() below.
+        refreshItineraryLiveDisplays(itinerary);
+      }
+    })
+  ]));
+
+  const receiptField = el("div", { class: "itinerary-field" });
+  receiptField.appendChild(document.createTextNode("Receipt"));
+  const receiptRow = el("div", { style: "margin-top:6px; display:flex; align-items:center; gap:8px; flex-wrap:wrap;" });
+  const receiptCount = (day.receiptPhotos || []).length;
+  receiptRow.appendChild(el("button", {
+    type: "button",
+    class: "photo-row-btn" + (receiptCount ? " has-photos" : ""),
+    id: "itinerary-receipt-btn",
+    onclick: () => openReceiptPhotoManager(itinerary, day, () => renderItinerarySoft(itinerary))
+  }, receiptCount ? ("\uD83D\uDCF7 " + receiptCount + " Receipt" + (receiptCount > 1 ? "s" : "")) : "\uD83D\uDCF7 Add Receipt"));
+  // Small visual reminder shown only when a Material Purchases amount
+  // has been entered but no receipt photo is attached yet - purely
+  // informational, never blocks Submit & Send. Kept in sync by
+  // refreshItineraryLiveDisplays() below (via the input's oninput
+  // above) and by the photo manager's onChange (via the full soft
+  // re-render, which recomputes receiptCount above on the next render).
+  const initialShowReminder = (parseFloat(day.materialPurchases) || 0) > 0 && !receiptCount;
+  receiptRow.appendChild(el("span", {
+    id: "itinerary-receipt-reminder",
+    style: "color:var(--mwt-red); font-size:12px; font-weight:600;" + (initialShowReminder ? "" : " display:none;")
+  }, "\u26A0 No receipt attached"));
+  receiptField.appendChild(receiptRow);
+  mileGrid.appendChild(receiptField);
+
   card.appendChild(mileGrid);
 
   return card;
@@ -733,6 +776,115 @@ function renderItineraryMilesNode(day) {
   return milesResult.error
     ? el("div", { class: "itinerary-error" }, milesResult.error)
     : el("div", { class: "itinerary-hours-display" }, "Total Miles: " + milesResult.miles);
+}
+
+// Reuses the exact same photo storage shape and Take Photo/Choose
+// Photo UI pattern as openLinePhotoManager() in app.js (an array of
+// {id, name, type, size, dataUrl} objects, compressImageFile() for
+// on-device resize/compression, the same "attach-list"/"attach-chip"
+// styling) - day.receiptPhotos[] is that same shape applied to a
+// Weekly Itinerary day's material-purchase receipts instead of a job
+// line item's photos. This is a separate function (rather than calling
+// openLinePhotoManager directly) only because it operates on an
+// itinerary day and must call the itinerary's own autosave
+// (scheduleItineraryAutosave) rather than the job autosave that
+// function uses - everything else about the pattern is identical.
+function openReceiptPhotoManager(itinerary, day, onChange) {
+  if (!day.receiptPhotos) day.receiptPhotos = [];
+  const overlay = el("div", { class: "modal-overlay", onclick: (e) => { if (e.target === overlay) close(); } });
+  const modal = el("div", { class: "modal" });
+  modal.appendChild(el("h3", {}, "Receipt Photos"));
+
+  const grid = el("div", { class: "attach-list" });
+  modal.appendChild(grid);
+
+  function redraw() {
+    grid.innerHTML = "";
+    if (!day.receiptPhotos.length) {
+      grid.appendChild(el("div", { class: "help-text" }, "No receipt photos yet for this day."));
+    }
+    day.receiptPhotos.forEach((p) => {
+      const chip = el("div", { class: "attach-chip" }, [
+        el("img", { class: "thumb thumb-lg", src: p.dataUrl }),
+        el("span", {}, (p.name || "Receipt") + " (" + humanSize(p.size) + ")"),
+        el("button", {
+          class: "remove",
+          title: "Remove this receipt photo",
+          onclick: () => {
+            day.receiptPhotos = day.receiptPhotos.filter((x) => x.id !== p.id);
+            scheduleItineraryAutosave(itinerary);
+            redraw();
+            if (onChange) onChange();
+          }
+        }, "\u2715")
+      ]);
+      grid.appendChild(chip);
+    });
+  }
+  redraw();
+
+  const fileInput = el("input", {
+    type: "file",
+    accept: "image/*",
+    multiple: "multiple",
+    style: "display:none;",
+    onchange: async (e) => {
+      const files = Array.from(e.target.files || []);
+      for (const file of files) {
+        try {
+          const dataUrl = await compressImageFile(file);
+          day.receiptPhotos.push({
+            id: uid(),
+            name: file.name,
+            type: "image/jpeg",
+            size: Math.round(dataUrl.length * 0.75),
+            dataUrl
+          });
+        } catch (err) {
+          toast("Could not process " + file.name + ": " + err.message, "error");
+        }
+      }
+      scheduleItineraryAutosave(itinerary);
+      redraw();
+      if (onChange) onChange();
+      e.target.value = "";
+    }
+  });
+
+  const takePhotoBtn = el("button", {
+    class: "btn btn-navy",
+    style: "margin-top:10px;",
+    onclick: () => {
+      fileInput.removeAttribute("multiple");
+      fileInput.setAttribute("capture", "environment");
+      fileInput.click();
+    }
+  }, "\uD83D\uDCF7 Take Photo");
+
+  const choosePhotoBtn = el("button", {
+    class: "btn btn-outline",
+    style: "margin-top:10px;",
+    onclick: () => {
+      fileInput.removeAttribute("capture");
+      fileInput.setAttribute("multiple", "multiple");
+      fileInput.click();
+    }
+  }, "\uD83D\uDDBC Choose Photo");
+
+  const photoBtnRow = el("div", { class: "btn-row" });
+  photoBtnRow.appendChild(takePhotoBtn);
+  photoBtnRow.appendChild(choosePhotoBtn);
+  modal.appendChild(photoBtnRow);
+  modal.appendChild(fileInput);
+
+  const btnRow = el("div", { class: "btn-row" });
+  btnRow.appendChild(el("button", { class: "btn btn-outline", onclick: close }, "Close"));
+  modal.appendChild(btnRow);
+
+  overlay.appendChild(modal);
+  document.body.appendChild(overlay);
+
+  function close() { overlay.remove(); }
 }
 
 // Updates only the small computed-value displays (this day's Hours
@@ -754,6 +906,16 @@ function refreshItineraryLiveDisplays(itinerary) {
     milesLive.appendChild(renderItineraryMilesNode(day));
   }
 
+  // Receipt reminder - visible only when this day has a Material
+  // Purchases amount greater than $0 but no receipt photo attached
+  // yet. Never blocks anything; purely a visual nudge.
+  const receiptReminder = document.getElementById("itinerary-receipt-reminder");
+  if (receiptReminder) {
+    const hasPurchase = (parseFloat(day.materialPurchases) || 0) > 0;
+    const hasReceipt = (day.receiptPhotos || []).length > 0;
+    receiptReminder.style.display = (hasPurchase && !hasReceipt) ? "" : "none";
+  }
+
   const totals = computeItineraryTotals(itinerary);
   const summaryValues = {
     totalHours: totals.totalHours.toFixed(2),
@@ -765,6 +927,7 @@ function refreshItineraryLiveDisplays(itinerary) {
     mileageReimbursement: "$" + totals.mileageReimbursement.toFixed(2),
     parkingFuel: "$" + totals.parkingFuel.toFixed(2),
     tolls: "$" + totals.tolls.toFixed(2),
+    materialPurchases: "$" + totals.materialPurchases.toFixed(2),
     totalReimbursable: "$" + totals.totalReimbursable.toFixed(2)
   };
   Object.keys(summaryValues).forEach((key) => {
@@ -825,6 +988,7 @@ function renderItineraryWeeklySummary(itinerary) {
     ["mileageReimbursement", "Mileage Reimbursement (@ $0.30/mi)", "$" + totals.mileageReimbursement.toFixed(2)],
     ["parkingFuel", "Parking / Fuel", "$" + totals.parkingFuel.toFixed(2)],
     ["tolls", "Tolls", "$" + totals.tolls.toFixed(2)],
+    ["materialPurchases", "Material Purchases", "$" + totals.materialPurchases.toFixed(2)],
     ["totalReimbursable", "Total Reimbursable Expenses", "$" + totals.totalReimbursable.toFixed(2)]
   ];
   const grid = el("div", { class: "itinerary-summary-grid" });
@@ -1030,6 +1194,7 @@ async function doSubmitItinerary(itinerary) {
       mileageReimbursement: totals.mileageReimbursement,
       parkingFuel: totals.parkingFuel,
       tolls: totals.tolls,
+      materialPurchases: totals.materialPurchases,
       totalReimbursable: totals.totalReimbursable,
       pdfBase64: base64Pdf
     });
