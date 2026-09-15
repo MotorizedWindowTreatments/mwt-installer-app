@@ -611,6 +611,61 @@ function buildItineraryPdfBlob(itinerary, opts) {
       "Start " + (day.startMileage || "\u2014") + "  \u00b7  End " + (day.endMileage || "\u2014") + "  \u00b7  Total " + milesText
     );
     labelValueLine("Tolls / Parking & Fuel", "$" + (parseFloat(day.tolls) || 0).toFixed(2) + "  /  $" + (parseFloat(day.parkingFuel) || 0).toFixed(2));
+    labelValueLine("Material Purchases", "$" + (parseFloat(day.materialPurchases) || 0).toFixed(2));
+
+    // Receipt photo(s) for this day, if any - rendered directly at
+    // their already-compressed size (openReceiptPhotoManager already
+    // runs every receipt through the same compressImageFile() used for
+    // job photos), immediately under this day's own section so they
+    // stay clearly associated with it. These are evidence/documentation
+    // rather than thumbnails, so each one is rendered large enough to
+    // actually read: one per row (not packed side-by-side), fit within
+    // a 300 x 420pt box while preserving its own original aspect ratio
+    // (never stretched, never cropped) - jsPDF's own
+    // getImageProperties() reads the image's real pixel dimensions
+    // synchronously from its data URL, so this stays a plain
+    // synchronous function exactly as before.
+    const receipts = day.receiptPhotos || [];
+    if (receipts.length) {
+      ensureSpace(14);
+      doc.setFont("helvetica", "bold");
+      doc.setFontSize(9);
+      doc.text("Receipt(s):", marginX, y);
+      y += 12;
+      const maxW = 300;
+      const maxH = 420;
+      const vGap = 10;
+      receipts.forEach((p) => {
+        let dispW = maxW, dispH = maxH;
+        try {
+          const props = doc.getImageProperties(p.dataUrl);
+          const scale = Math.min(maxW / props.width, maxH / props.height);
+          dispW = props.width * scale;
+          dispH = props.height * scale;
+        } catch (e) {
+          // Could not read this image's real dimensions - fall back to
+          // the maxW x maxH box as-is, so a single bad receipt still
+          // renders something reasonable rather than breaking the page
+          // layout.
+        }
+
+        // A single receipt image is never split across a page break -
+        // if it won't fit in the remaining space on the current page, a
+        // new page is started BEFORE rendering it, not partway through.
+        if (y + dispH > pageHeight - 50) {
+          doc.addPage();
+          y = 40;
+        }
+
+        try {
+          doc.addImage(p.dataUrl, undefined, marginX, y, dispW, dispH, undefined, "FAST");
+        } catch (e) {
+          doc.rect(marginX, y, dispW, dispH);
+        }
+        y += dispH + vGap;
+      });
+    }
+
     y += 4;
   });
 
@@ -627,6 +682,7 @@ function buildItineraryPdfBlob(itinerary, opts) {
     ["Mileage Reimbursement (@ $0.30/mi)", "$" + totals.mileageReimbursement.toFixed(2)],
     ["Parking / Fuel", "$" + totals.parkingFuel.toFixed(2)],
     ["Tolls", "$" + totals.tolls.toFixed(2)],
+    ["Material Purchases", "$" + totals.materialPurchases.toFixed(2)],
     ["Total Reimbursable Expenses", "$" + totals.totalReimbursable.toFixed(2)]
   ];
   doc.autoTable({
