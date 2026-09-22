@@ -31,8 +31,11 @@
    Expenses cells), not re-derived from the prose description alone.
    ============================================================ */
 
-const ITINERARY_INSTALLER_PRESETS = ["Bill", "Victor", "Matthew", "Carlos", "Other"];
-const ITINERARY_WORK_PERFORMED_OPTIONS = ["Install", "Measure", "Service Call", "Cut-Down", "Retrofit"];
+const ITINERARY_INSTALLER_PRESETS = ["Bill", "Victor", "Matthew", "Carlos", "Ruben", "Other"];
+const ITINERARY_WORK_PERFORMED_OPTIONS = [
+  "Install", "Measure", "Field Service Call", "Cut-down", "Motorization Retrofit",
+  "Drapery Track Build", "In-house Repair", "Warehouse Organization"
+];
 const ITINERARY_DAY_KEYS = ["mon", "tue", "wed", "thu", "fri", "sat"];
 const ITINERARY_DAY_LABELS = { mon: "MON", tue: "TUE", wed: "WED", thu: "THU", fri: "FRI", sat: "SAT" };
 const ITINERARY_DAY_FULL_LABELS = { mon: "MONDAY", tue: "TUESDAY", wed: "WEDNESDAY", thu: "THURSDAY", fri: "FRIDAY", sat: "SATURDAY" };
@@ -351,19 +354,43 @@ function itnComputeDayMiles(day) {
   return { miles: end - start, error: null };
 }
 
+// Maps a stored Work Performed value to its Weekly Summary counter key.
+// Matches by EXACT value (case-insensitive, trimmed) rather than by
+// prefix, deliberately - Cut-down and Motorization Retrofit must never
+// be conflated with one another, and exact matching is the safest way
+// to guarantee that as the category list grows. Also recognizes the
+// three older values used before this update (Service Call, Cut-Down,
+// Retrofit) so a previously saved itinerary keeps calculating
+// correctly even though those exact strings are no longer selectable
+// options - the stored value itself is never read here as anything
+// but a lookup key, so an old record is never rewritten just by being
+// reopened. An unrecognized value (including one that's been corrupted
+// or predates even those older values) safely returns null and is
+// simply not counted in any category, rather than crashing or
+// silently miscounting.
 function itnWorkPerformedCategory(value) {
   const v = (value || "").trim().toLowerCase();
   if (!v) return null;
-  if (v.indexOf("install") === 0) return "installs";
-  if (v.indexOf("measure") === 0) return "measures";
-  if (v.indexOf("cut") === 0 || v.indexOf("retro") === 0) return "cutDownRetrofits";
-  if (v.indexOf("service") === 0) return "serviceCalls";
+  // Current dropdown options.
+  if (v === "install") return "installs";
+  if (v === "measure") return "measures";
+  if (v === "field service call") return "fieldServiceCalls";
+  if (v === "cut-down") return "cutDowns";
+  if (v === "motorization retrofit") return "motorizationRetrofits";
+  if (v === "drapery track build") return "draperyTrackBuilds";
+  if (v === "in-house repair") return "inHouseRepairs";
+  if (v === "warehouse organization") return "warehouseOrganization";
+  // Older values from before this update.
+  if (v === "service call") return "fieldServiceCalls";
+  if (v === "retrofit") return "motorizationRetrofits";
   return null;
 }
 
 function computeItineraryTotals(itinerary) {
   const totals = {
-    totalHours: 0, installs: 0, measures: 0, cutDownRetrofits: 0, serviceCalls: 0,
+    totalHours: 0,
+    installs: 0, measures: 0, fieldServiceCalls: 0, cutDowns: 0, motorizationRetrofits: 0,
+    draperyTrackBuilds: 0, inHouseRepairs: 0, warehouseOrganization: 0,
     totalMiles: 0, mileageReimbursement: 0, parkingFuel: 0, tolls: 0, materialPurchases: 0, totalReimbursable: 0
   };
   ITINERARY_DAY_KEYS.forEach((k) => {
@@ -960,8 +987,12 @@ function refreshItineraryLiveDisplays(itinerary) {
     totalHours: totals.totalHours.toFixed(2),
     installs: String(totals.installs),
     measures: String(totals.measures),
-    cutDownRetrofits: String(totals.cutDownRetrofits),
-    serviceCalls: String(totals.serviceCalls),
+    fieldServiceCalls: String(totals.fieldServiceCalls),
+    cutDowns: String(totals.cutDowns),
+    motorizationRetrofits: String(totals.motorizationRetrofits),
+    draperyTrackBuilds: String(totals.draperyTrackBuilds),
+    inHouseRepairs: String(totals.inHouseRepairs),
+    warehouseOrganization: String(totals.warehouseOrganization),
     totalMiles: totals.totalMiles.toFixed(1),
     mileageReimbursement: "$" + totals.mileageReimbursement.toFixed(2),
     parkingFuel: "$" + totals.parkingFuel.toFixed(2),
@@ -996,6 +1027,21 @@ function renderItineraryJobRow(itinerary, day, job, idx) {
   ITINERARY_WORK_PERFORMED_OPTIONS.forEach((opt) => {
     workSelect.appendChild(el("option", { value: opt, selected: job.workPerformed === opt ? "selected" : null }, opt));
   });
+  // If this job's stored Work Performed value predates this update
+  // (e.g. "Service Call", "Cut-Down", "Retrofit") it won't exactly
+  // match any of the current options above, and the <select> would
+  // otherwise show nothing selected even though a value is genuinely
+  // stored. Add that original value as one extra option, for THIS row
+  // only, so the saved selection stays visibly correct instead of
+  // appearing blank. This never touches job.workPerformed itself (read
+  // only) and never modifies ITINERARY_WORK_PERFORMED_OPTIONS, so a
+  // newly created job's dropdown is completely unaffected - the moment
+  // the installer picks a different value here, the onchange handler
+  // above saves it normally and this extra option is simply not
+  // re-added on the next render.
+  if (job.workPerformed && !ITINERARY_WORK_PERFORMED_OPTIONS.includes(job.workPerformed)) {
+    workSelect.appendChild(el("option", { value: job.workPerformed, selected: "selected" }, job.workPerformed));
+  }
   row.appendChild(workSelect);
   row.appendChild(el("input", {
     type: "text", placeholder: "Product", class: "itinerary-job-product", value: job.product,
@@ -1021,8 +1067,12 @@ function renderItineraryWeeklySummary(itinerary) {
     ["totalHours", "Total Hours", totals.totalHours.toFixed(2)],
     ["installs", "Installs", totals.installs],
     ["measures", "Measures", totals.measures],
-    ["cutDownRetrofits", "Cut-Downs / Retrofits", totals.cutDownRetrofits],
-    ["serviceCalls", "Service Calls", totals.serviceCalls],
+    ["fieldServiceCalls", "Field Service Calls", totals.fieldServiceCalls],
+    ["cutDowns", "Cut-downs", totals.cutDowns],
+    ["motorizationRetrofits", "Motorization Retrofits", totals.motorizationRetrofits],
+    ["draperyTrackBuilds", "Drapery Track Builds", totals.draperyTrackBuilds],
+    ["inHouseRepairs", "In-house Repairs", totals.inHouseRepairs],
+    ["warehouseOrganization", "Warehouse Organization", totals.warehouseOrganization],
     ["totalMiles", "Total Miles", totals.totalMiles.toFixed(1)],
     ["mileageReimbursement", "Mileage Reimbursement (@ $0.30/mi)", "$" + totals.mileageReimbursement.toFixed(2)],
     ["parkingFuel", "Parking / Fuel", "$" + totals.parkingFuel.toFixed(2)],
@@ -1227,8 +1277,20 @@ async function doSubmitItinerary(itinerary) {
       totalHours: totals.totalHours,
       installs: totals.installs,
       measures: totals.measures,
-      cutDownRetrofits: totals.cutDownRetrofits,
-      serviceCalls: totals.serviceCalls,
+      fieldServiceCalls: totals.fieldServiceCalls,
+      cutDowns: totals.cutDowns,
+      motorizationRetrofits: totals.motorizationRetrofits,
+      draperyTrackBuilds: totals.draperyTrackBuilds,
+      inHouseRepairs: totals.inHouseRepairs,
+      warehouseOrganization: totals.warehouseOrganization,
+      // Backward-compat fields, preserved additively for the existing
+      // Apps Script backend / Google Sheet columns - computed as the
+      // sum of the new split categories so anything still reading these
+      // two field names keeps working exactly as before, even though
+      // the app itself now tracks Cut-downs and Motorization Retrofits
+      // (and the other new categories) separately.
+      cutDownRetrofits: totals.cutDowns + totals.motorizationRetrofits,
+      serviceCalls: totals.fieldServiceCalls,
       totalMiles: totals.totalMiles,
       mileageReimbursement: totals.mileageReimbursement,
       parkingFuel: totals.parkingFuel,
