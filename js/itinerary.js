@@ -424,8 +424,31 @@ async function persistItinerary(itinerary, opts) {
   if (!opts.silent) setSaveIndicator("saved");
 }
 
+// Centralized resubmission prep. Every Weekly Itinerary edit already
+// funnels through scheduleItineraryAutosave() below, so this one check
+// covers all of them (times, jobs, add/remove job, mileage, expenses,
+// receipts) without touching any individual input handler. The first
+// edit to an itinerary whose status is "submitted" turns that SAME local
+// record back into an editable draft with a brand-new submissionId, so
+// the corrected version goes to the backend as its own separate
+// submission (the backend's duplicate protection for the original ID is
+// left exactly as it is, and the original PDF/row stay archived).
+// The status change itself is the "only once" latch: after this runs
+// the status is "draft", so every later edit - and every retry of a
+// failed send - keeps the SAME new submissionId until that corrected
+// version is actually confirmed as submitted. revision and submittedAt
+// are deliberately left alone here; revision only moves forward when a
+// submission succeeds (see doSubmitItinerary). Merely opening or
+// rendering an itinerary never calls this, so it can't generate an ID.
+function itnPrepareResubmissionOnEdit(itinerary) {
+  if (itinerary.status !== "submitted") return;
+  itinerary.submissionId = uid();
+  itinerary.status = "draft";
+}
+
 let _itineraryAutosaveTimer = null;
 function scheduleItineraryAutosave(itinerary) {
+  itnPrepareResubmissionOnEdit(itinerary);
   setSaveIndicator("unsaved");
   if (_itineraryAutosaveTimer) clearTimeout(_itineraryAutosaveTimer);
   _itineraryAutosaveTimer = setTimeout(async () => {
@@ -1224,6 +1247,16 @@ function validateItineraryForSubmit(itinerary) {
 }
 
 function confirmSubmitItinerary(itinerary) {
+  // Still "submitted" means it has not been edited since it was last
+  // sent (the first edit flips it back to a draft with a new
+  // submissionId - see itnPrepareResubmissionOnEdit), so there is
+  // nothing new to send. Blocking here prevents an accidental duplicate
+  // payroll submission.
+  if (itinerary.status === "submitted") {
+    toast("This itinerary has already been submitted. Make an adjustment before resubmitting.");
+    return;
+  }
+
   const name = itineraryInstallerName(itinerary);
   if (!name) {
     toast("Please select or enter an Installer name before submitting.", "error");
@@ -1236,10 +1269,16 @@ function confirmSubmitItinerary(itinerary) {
     return;
   }
 
+  // A revision above 0 means a version of this itinerary was already
+  // successfully sent, so what's being sent now is a correction. A
+  // brand-new itinerary (revision 0) keeps the original wording.
+  const isResubmission = (itinerary.revision || 0) > 0;
   openModal({
-    title: "Submit this weekly itinerary?",
-    body: "You're about to finalize \u201c" + itineraryDisplayName(itinerary) + "\u201d, generate the PDF, and send it to Matthew.",
-    confirmLabel: "Submit & Send",
+    title: isResubmission ? "Resubmit this weekly itinerary?" : "Submit this weekly itinerary?",
+    body: isResubmission
+      ? "You're about to send a corrected version of \u201c" + itineraryDisplayName(itinerary) + "\u201d. The PDF will be regenerated and sent to Matthew."
+      : "You're about to finalize \u201c" + itineraryDisplayName(itinerary) + "\u201d, generate the PDF, and send it to Matthew.",
+    confirmLabel: isResubmission ? "Resubmit & Send" : "Submit & Send",
     confirmClass: "btn-primary",
     onConfirm: () => doSubmitItinerary(itinerary)
   });
