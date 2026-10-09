@@ -611,8 +611,49 @@ button, input, select, textarea {
   width: 26px; height: 26px;
   border-radius: 50%;
 }
-.attach-chip img.thumb { width: 30px; height: 30px; object-fit: cover; border-radius: 5px; }
-.attach-chip img.thumb.thumb-lg { width: 64px; height: 64px; }
+.attach-chip img.thumb { width: 60px; height: 60px; object-fit: cover; border-radius: 5px; flex: none; cursor: zoom-in; }
+.attach-chip img.thumb.thumb-lg { width: 128px; height: 128px; }
+/* Chips holding a (now larger) photo thumbnail use a softer corner radius
+   instead of the full pill shape, so the image corners are never clipped. */
+.attach-chip.has-thumb { border-radius: 16px; }
+
+/* Full-screen photo viewer (opened by tapping a thumbnail) */
+.photo-viewer {
+  position: fixed; inset: 0;
+  z-index: 1000;
+  background: rgba(0,0,0,0.92);
+  touch-action: none;
+  -webkit-user-select: none; user-select: none;
+  -webkit-touch-callout: none;
+}
+.photo-viewer-stage {
+  position: absolute; inset: 0;
+  display: flex; align-items: center; justify-content: center;
+  overflow: hidden;
+  touch-action: none;
+}
+.photo-viewer-img {
+  flex: none;
+  max-width: none; max-height: none;
+  transform-origin: 50% 50%;
+  visibility: hidden;
+  -webkit-user-drag: none;
+  -webkit-touch-callout: none;
+}
+.photo-viewer-img.ready { visibility: visible; }
+.photo-viewer-close {
+  position: absolute;
+  top: max(12px, env(safe-area-inset-top));
+  right: max(12px, env(safe-area-inset-right));
+  width: 48px; height: 48px;
+  border: none; border-radius: 50%;
+  background: rgba(255,255,255,0.92);
+  color: #111;
+  font-size: 22px; line-height: 1;
+  cursor: pointer;
+  z-index: 2;
+  touch-action: manipulation;
+}
 
 .file-drop {
   border: 2px dashed var(--mwt-border);
