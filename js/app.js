@@ -1325,6 +1325,194 @@ function renderLineItemsTable(job, spec) {
 // Attachments
 // ---------------------------------------------------------------
 
+// ---------------------------------------------------------------
+// Full-screen photo viewer (display-only)
+// ---------------------------------------------------------------
+// Opened by tapping a photo thumbnail (general attachments and per-line
+// photos). It only READS the photo's already-stored dataUrl string and
+// hands it to a single <img>; no copy, re-encode or resize of the image
+// is made, only one viewer exists at a time, and nothing here touches
+// the job, scheduleAutosave() or IndexedDB. Pinch zoom / pan / double-tap
+// are handled natively with Pointer Events (no library), because the
+// page viewport deliberately disables browser zoom. Closing removes the
+// viewer DOM, its listeners and the <img> source, so nothing is retained.
+// Closing uses the "click" event (never pointerup) so the browser's
+// follow-up click can never land on the Remove button underneath.
+let _photoViewerClose = null;
+
+function openPhotoViewer(src, title) {
+  if (!src) return;
+  if (_photoViewerClose) _photoViewerClose();
+
+  const MAX_SCALE = 6;
+  const img = el("img", { class: "photo-viewer-img", alt: title || "Photo", draggable: "false" });
+  const stage = el("div", { class: "photo-viewer-stage" }, [img]);
+  const closeBtn = el("button", {
+    type: "button",
+    class: "photo-viewer-close",
+    title: "Close",
+    "aria-label": "Close photo",
+    onclick: () => close()
+  }, "✕");
+  const viewer = el("div", { class: "photo-viewer", role: "dialog", "aria-modal": "true" }, [stage, closeBtn]);
+
+  let scale = 1, tx = 0, ty = 0;
+  let closed = false;
+  let gestured = false;      // true once a drag/pinch happened - suppresses the tap-to-close click
+  let lastTap = 0;
+  let downX = 0, downY = 0;
+  let prevDist = 0, prevMx = 0, prevMy = 0;
+  const pointers = new Map();
+
+  function apply() {
+    img.style.transform = "translate(" + tx + "px," + ty + "px) scale(" + scale + ")";
+  }
+  function clampPan() {
+    const maxX = Math.max(0, (img.offsetWidth * scale - stage.clientWidth) / 2);
+    const maxY = Math.max(0, (img.offsetHeight * scale - stage.clientHeight) / 2);
+    tx = Math.min(maxX, Math.max(-maxX, tx));
+    ty = Math.min(maxY, Math.max(-maxY, ty));
+  }
+  // Sizes the <img> to the largest size that fits the screen at its own
+  // aspect ratio (so it is never stretched), then re-applies the transform.
+  function layout() {
+    const nw = img.naturalWidth, nh = img.naturalHeight;
+    const vw = stage.clientWidth, vh = stage.clientHeight;
+    if (!nw || !nh || !vw || !vh) return;
+    const fit = Math.min(vw / nw, vh / nh);
+    img.style.width = Math.round(nw * fit) + "px";
+    img.style.height = Math.round(nh * fit) + "px";
+    clampPan();
+    apply();
+  }
+  // Zoom to newScale keeping the content under stage-centre-relative point (mx,my).
+  function zoomAbout(newScale, mx, my) {
+    const s = Math.min(MAX_SCALE, Math.max(1, newScale));
+    const ratio = s / scale;
+    tx = mx - (mx - tx) * ratio;
+    ty = my - (my - ty) * ratio;
+    scale = s;
+    if (scale <= 1.001) { scale = 1; tx = 0; ty = 0; }
+    clampPan();
+    apply();
+  }
+  function rel(e) {
+    const r = stage.getBoundingClientRect();
+    return { x: e.clientX - (r.left + r.width / 2), y: e.clientY - (r.top + r.height / 2) };
+  }
+  function pinchInfo() {
+    const pts = Array.from(pointers.values());
+    const a = pts[0], b = pts[1];
+    const r = stage.getBoundingClientRect();
+    return {
+      dist: Math.hypot(a.x - b.x, a.y - b.y) || 1,
+      mx: (a.x + b.x) / 2 - (r.left + r.width / 2),
+      my: (a.y + b.y) / 2 - (r.top + r.height / 2)
+    };
+  }
+
+  function onDown(e) {
+    if (e.target === closeBtn) return;
+    pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    if (pointers.size === 1) {
+      gestured = false;
+      downX = e.clientX; downY = e.clientY;
+    } else if (pointers.size === 2) {
+      gestured = true;
+      const p = pinchInfo();
+      prevDist = p.dist; prevMx = p.mx; prevMy = p.my;
+    }
+  }
+  function onMove(e) {
+    const prev = pointers.get(e.pointerId);
+    if (!prev) return;
+    const dx = e.clientX - prev.x, dy = e.clientY - prev.y;
+    prev.x = e.clientX; prev.y = e.clientY;
+    if (pointers.size >= 2) {
+      const p = pinchInfo();
+      const s = Math.min(MAX_SCALE, Math.max(1, scale * (p.dist / prevDist)));
+      const ratio = s / scale;
+      // Keep the content under the previous pinch midpoint under the new one.
+      tx = p.mx - (prevMx - tx) * ratio;
+      ty = p.my - (prevMy - ty) * ratio;
+      scale = s;
+      prevDist = p.dist; prevMx = p.mx; prevMy = p.my;
+      clampPan();
+      apply();
+    } else {
+      if (Math.hypot(e.clientX - downX, e.clientY - downY) > 8) gestured = true;
+      if (scale > 1) {
+        tx += dx; ty += dy;
+        clampPan();
+        apply();
+      }
+    }
+  }
+  function onUp(e) {
+    if (!pointers.has(e.pointerId)) return;
+    pointers.delete(e.pointerId);
+    if (scale <= 1.02) { scale = 1; tx = 0; ty = 0; apply(); }
+    if (pointers.size === 1) {
+      // Finger lifted from a pinch: continue as a pan from the remaining finger.
+      gestured = true;
+      const rest = pointers.values().next().value;
+      downX = rest.x; downY = rest.y;
+    }
+    // Double-tap on the image toggles between fit and 2.5x.
+    if (e.type === "pointerup" && !gestured && pointers.size === 0 && e.target === img) {
+      const now = Date.now();
+      if (now - lastTap < 320) {
+        lastTap = 0;
+        const c = rel(e);
+        if (scale > 1) zoomAbout(1, 0, 0); else zoomAbout(2.5, c.x, c.y);
+      } else {
+        lastTap = now;
+      }
+    }
+  }
+  // Tap on the dark area outside the photo closes the viewer; taps on the
+  // photo itself, or the end of a drag/pinch, never do.
+  function onClick(e) {
+    if (gestured) { gestured = false; return; }
+    if (e.target === viewer || e.target === stage) close();
+  }
+  function onKey(e) {
+    if (e.key === "Escape") close();
+  }
+
+  function close() {
+    if (closed) return;
+    closed = true;
+    document.removeEventListener("keydown", onKey);
+    window.removeEventListener("resize", layout);
+    viewer.removeEventListener("pointerdown", onDown);
+    viewer.removeEventListener("pointermove", onMove);
+    viewer.removeEventListener("pointerup", onUp);
+    viewer.removeEventListener("pointercancel", onUp);
+    viewer.removeEventListener("click", onClick);
+    img.onload = null;
+    img.onerror = null;
+    img.removeAttribute("src");
+    pointers.clear();
+    viewer.remove();
+    if (_photoViewerClose === close) _photoViewerClose = null;
+  }
+
+  viewer.addEventListener("pointerdown", onDown);
+  viewer.addEventListener("pointermove", onMove);
+  viewer.addEventListener("pointerup", onUp);
+  viewer.addEventListener("pointercancel", onUp);
+  viewer.addEventListener("click", onClick);
+  document.addEventListener("keydown", onKey);
+  window.addEventListener("resize", layout);
+  img.onload = () => { layout(); img.classList.add("ready"); };
+  img.onerror = () => { toast("Could not display this photo.", "error"); close(); };
+
+  _photoViewerClose = close;
+  document.body.appendChild(viewer);
+  img.src = src;
+}
+
 function renderAttachments(job) {
   const wrap = el("div", {});
   const list = el("div", { class: "attach-list" });
@@ -1333,8 +1521,8 @@ function renderAttachments(job) {
     list.innerHTML = "";
     job.attachments.forEach((att) => {
       const isImg = att.type && att.type.startsWith("image/");
-      const chip = el("div", { class: "attach-chip" }, [
-        isImg ? el("img", { class: "thumb", src: att.dataUrl }) : null,
+      const chip = el("div", { class: "attach-chip" + (isImg ? " has-thumb" : "") }, [
+        isImg ? el("img", { class: "thumb", src: att.dataUrl, title: "Tap to enlarge", onclick: () => openPhotoViewer(att.dataUrl, att.name) }) : null,
         el("span", {}, att.name + " (" + humanSize(att.size) + ")"),
         el("button", {
           class: "remove",
@@ -1499,8 +1687,8 @@ function openLinePhotoManager(job, row, lineNumber, onChange) {
       grid.appendChild(el("div", { class: "help-text" }, "No photos yet for this line."));
     }
     row.photos.forEach((p) => {
-      const chip = el("div", { class: "attach-chip" }, [
-        el("img", { class: "thumb thumb-lg", src: p.dataUrl }),
+      const chip = el("div", { class: "attach-chip has-thumb" }, [
+        el("img", { class: "thumb thumb-lg", src: p.dataUrl, title: "Tap to enlarge", onclick: () => openPhotoViewer(p.dataUrl, p.name) }),
         el("span", {}, (p.name || "Photo") + " (" + humanSize(p.size) + ")"),
         el("button", {
           class: "remove",
