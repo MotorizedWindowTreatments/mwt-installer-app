@@ -47,7 +47,16 @@ async function buildJobPdfBlob(job, schema, opts) {
   // optimized copies is ever built up. For a normal (non-large-mode)
   // job, the original dataURL is passed straight through exactly as
   // before, byte-for-byte identical to current production behavior.
-  async function renderPhotoImage(dataUrl, x, y, thumbW, thumbH) {
+  //
+  // Placement: the caller passes layoutPhoto(imageData), which (after the
+  // image is known) draws any heading, performs any page break, and
+  // returns the {x, y, w, h} box to draw into. The size is chosen by
+  // fitPhotoSize() from the image's own aspect ratio, so a photo is
+  // only ever shown larger or smaller on the page (display size) - the
+  // pixel data handed to addImage() is exactly the same data as before
+  // (original for normal jobs, the temporary optimized copy in large
+  // mode). Returns the box that was used.
+  async function renderPhotoImage(dataUrl, layoutPhoto) {
     let toRender = dataUrl;
     if (isLargeMode) {
       try {
@@ -61,12 +70,13 @@ async function buildJobPdfBlob(job, schema, opts) {
         toRender = dataUrl;
       }
     }
+    const box = layoutPhoto(toRender);
     try {
-      doc.addImage(toRender, undefined, x, y, thumbW, thumbH, undefined, "FAST");
+      doc.addImage(toRender, undefined, box.x, box.y, box.w, box.h, undefined, "FAST");
     } catch (e) {
-      doc.rect(x, y, thumbW, thumbH);
+      doc.rect(box.x, box.y, box.w, box.h);
       doc.setFontSize(8);
-      doc.text("Could not preview", x + 8, y + thumbH / 2);
+      doc.text("Could not preview", box.x + 8, box.y + box.h / 2);
     }
     toRender = null; // release the temporary optimized copy immediately
     processedImages++;
@@ -74,7 +84,32 @@ async function buildJobPdfBlob(job, schema, opts) {
     // Yielding only happens in large-photo mode - a normal job's
     // generation timing/behavior is otherwise unaffected.
     if (isLargeMode) await yieldToEventLoop();
+    return box;
   }
+
+  // Largest size that fits inside maxW x maxH while keeping the image's
+  // own aspect ratio (never stretched or distorted, portrait or
+  // landscape). If the image's dimensions cannot be read, a 4:3 box is
+  // used; addImage() will then fail the same way and the existing
+  // "Could not preview" placeholder is drawn instead.
+  function fitPhotoSize(imageData, maxW, maxH) {
+    let ratio = 4 / 3;
+    try {
+      const props = doc.getImageProperties(imageData);
+      if (props && props.width > 0 && props.height > 0) ratio = props.width / props.height;
+    } catch (e) {
+      // keep the default ratio
+    }
+    let w = maxW;
+    let h = w / ratio;
+    if (h > maxH) { h = maxH; w = h * ratio; }
+    return { w, h };
+  }
+
+  // Display-size limits for photos in the PDF (points). These control
+  // only how much page area a photo uses - not its resolution.
+  const photoContentW = pageWidth - marginX * 2;
+  const photoMaxH = wide ? 420 : 470;
 
   function drawHeader() {
     doc.setFillColor(22, 35, 63); // navy
@@ -385,30 +420,39 @@ async function buildJobPdfBlob(job, schema, opts) {
       doc.text("PROJECT PHOTOS", marginX, y);
       y += 20;
 
-      const thumbW = wide ? 220 : 170;
-      const thumbH = wide ? 165 : 130;
-      const gap = 14;
-
       for (let idx = 0; idx < job.lineItems.length; idx++) {
         const row = job.lineItems[idx];
         const photos = row.photos || [];
         if (!photos.length) continue;
 
-        ensureSpace(thumbH + 40);
-        doc.setFont("helvetica", "bold");
-        doc.setFontSize(11);
-        const heading = "LINE " + (idx + 1) + " \u2014 " + (row.room || "\u2014") + (row.productName ? " \u2014 " + row.productName : "");
-        doc.text(heading, marginX, y);
-        y += 16;
+        const baseHeading = "LINE " + (idx + 1) + " \u2014 " + (row.room || "\u2014") + (row.productName ? " \u2014 " + row.productName : "");
 
-        let x = marginX;
-        for (const p of photos) {
-          if (x + thumbW > pageWidth - marginX) { x = marginX; y += thumbH + 22; }
-          if (y + thumbH + 22 > pageHeight - 30) { doc.addPage(wide ? "landscape" : "portrait"); y = 40; x = marginX; }
-          await renderPhotoImage(p.dataUrl, x, y, thumbW, thumbH);
-          x += thumbW + gap;
+        // One large photo per block, each with its own "LINE n \u2026 Photo"
+        // heading so the line association is always obvious, even when
+        // a line has several photos or a photo lands on a new page.
+        for (let pi = 0; pi < photos.length; pi++) {
+          const heading = baseHeading + " \u2014 Photo" + (photos.length > 1 ? " " + (pi + 1) + " of " + photos.length : "");
+          await renderPhotoImage(photos[pi].dataUrl, (imageData) => {
+            doc.setFont("helvetica", "bold");
+            doc.setFontSize(11);
+            const headingLines = doc.splitTextToSize(heading, photoContentW);
+            const headingH = headingLines.length * 13 + 3;
+            // A fresh page can always hold the heading plus a photo of
+            // this size, so the photo is never taller than a page.
+            const size = fitPhotoSize(imageData, photoContentW, Math.min(photoMaxH, pageHeight - 50 - 40 - headingH));
+            if (y + headingH + size.h > pageHeight - 50) {
+              doc.addPage(wide ? "landscape" : "portrait");
+              y = 40;
+            }
+            doc.setFont("helvetica", "bold");
+            doc.setFontSize(11);
+            doc.text(headingLines, marginX, y);
+            y += headingH;
+            const box = { x: marginX, y: y, w: size.w, h: size.h };
+            y += size.h + 18;
+            return box;
+          });
         }
-        y += thumbH + 28;
       }
     }
   }
@@ -431,25 +475,24 @@ async function buildJobPdfBlob(job, schema, opts) {
     doc.text("ATTACHED JOB PHOTOS", marginX, y);
     y += 20;
 
-    const thumbW = wide ? 220 : 170;
-    const thumbH = wide ? 165 : 130;
-    const gap = 14;
-    let x = marginX;
-
     for (const a of attachmentImages) {
-      if (x + thumbW > pageWidth - marginX) { x = marginX; y += thumbH + 22; }
-      if (y + thumbH + 22 > pageHeight - 30) { doc.addPage(wide ? "landscape" : "portrait"); y = 40; x = marginX; }
-      await renderPhotoImage(a.dataUrl, x, y, thumbW, thumbH);
-      // Filename caption directly under each thumbnail, where practical
-      // (truncated to fit the thumbnail's own width so it never runs
-      // into the next photo).
+      // Filename caption directly under each photo (first line only,
+      // as before), drawn after the image.
+      const captionH = 14;
+      const box = await renderPhotoImage(a.dataUrl, (imageData) => {
+        const size = fitPhotoSize(imageData, photoContentW, Math.min(photoMaxH, pageHeight - 50 - 40 - captionH));
+        if (y + size.h + captionH > pageHeight - 50) {
+          doc.addPage(wide ? "landscape" : "portrait");
+          y = 40;
+        }
+        return { x: marginX, y: y, w: size.w, h: size.h };
+      });
       doc.setFont("helvetica", "normal");
       doc.setFontSize(7.5);
-      const captionLines = doc.splitTextToSize(a.name || "", thumbW);
-      doc.text(captionLines[0] || "", x, y + thumbH + 10);
-      x += thumbW + gap;
+      const captionLines = doc.splitTextToSize(a.name || "", photoContentW);
+      doc.text(captionLines[0] || "", box.x, box.y + box.h + 10);
+      y = box.y + box.h + captionH + 14;
     }
-    y += thumbH + 28;
   }
 
   // Footer note + page numbers on every page
