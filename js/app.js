@@ -3222,17 +3222,27 @@ async function doSubmit(job, schema) {
     overlay.setStage("Sending\u2026", "Please keep the app open until the submission is complete.");
     await yieldToEventLoop();
 
-    const fileName = pdfFileName(job, schema);
+    // Revision prefix - ONLY for a true resubmission of an already
+    // submitted job (isResend). job.revision is the existing counter
+    // that is incremented once per successful submission (original = 1
+    // after it succeeds, so the first true resubmission is "Revision 1",
+    // the next "Revision 2", etc.). It is not touched until a submission
+    // actually succeeds, so a retry of the same pending submission keeps
+    // the same number. The original submission gets no prefix at all.
+    // The prefix is added in FRONT of the unchanged, already-generated
+    // filename / email subject.
+    const revisionPrefix = isResend ? "Revision " + Math.max(1, job.revision || 0) + " - " : "";
+    const fileName = revisionPrefix + pdfFileName(job, schema);
     const jobName = computeDisplayName(job);
     const formType = schema.label || schema.pdfTitle;
     // Email subject is ONLY "Design Firm - Sidemark" (e.g. "MWT \u2013 Kandl"),
     // built directly from the entered field values - NOT the manually
     // entered Job Name, and with no form name appended. (The PDF's own
     // "Job Name" line still uses computeDisplayName() as before - this
-    // only affects the email subject.) Unchanged for a resend - no
-    // revision number or "UPDATED" marker is added to the subject in
-    // this revision.
-    const subject = buildEmailSubject(job);
+    // only affects the email subject.) For a true resubmission only,
+    // the unchanged subject is prefixed with "Revision N - " (see
+    // revisionPrefix above).
+    const subject = revisionPrefix + buildEmailSubject(job);
     const designerEmail = getDesignerEmail(job);
 
     // Backward-compat: a job saved before this update won't have a
