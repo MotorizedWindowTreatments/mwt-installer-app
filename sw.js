@@ -11,7 +11,7 @@
    the update instead of a stale cached copy.
    ============================================================ */
 
-const CACHE_NAME = "mwt-installer-shell-v34";
+const CACHE_NAME = "mwt-installer-shell-v35";
 
 const CORE_ASSETS = [
   "./",
