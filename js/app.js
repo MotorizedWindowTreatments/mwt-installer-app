@@ -1953,6 +1953,205 @@ function loadPdfJs() {
   return _pdfjsLibPromise;
 }
 
+// ---------------------------------------------------------------
+// PDF viewer zoom (display-only)
+// ---------------------------------------------------------------
+// Shared by the Installer Preview PDF viewer and the Admin single-page
+// viewer. It only changes the CSS display size of the canvases that are
+// ALREADY rendered - the PDF is never regenerated and PDF.js is never
+// asked to re-render, so there is no extra memory or CPU per pinch.
+//   - Two-finger pinch zooms between 1x and 4x around the fingers;
+//     double-tap toggles 1x <-> 2.5x.
+//   - While zoomed, the scroller's own native overflow scrolling pans
+//     (one finger, both axes). At 1x nothing is changed: the viewer
+//     keeps its normal vertical scrolling.
+//   - Touch listeners are removed by detach(), which both viewers call
+//     when they close; reset() restores the exact original canvas sizes.
+function attachPdfZoom(scroller) {
+  const MAX_SCALE = 4;
+  const DOUBLE_TAP_SCALE = 2.5;
+  let scale = 1;
+  const base = new Map(); // canvas -> its original (1x) inline width/height
+  let pinching = false, startDist = 0, startScale = 1;
+  let tapMoved = true, tapStartT = 0, lastTap = 0, lastTapX = 0, lastTapY = 0, tapX = 0, tapY = 0;
+
+  // Allows native one-finger scrolling but hands pinch gestures to us.
+  scroller.style.touchAction = "pan-x pan-y";
+
+  function liveCanvases() {
+    return Array.from(scroller.querySelectorAll("canvas.pdf-page-canvas"))
+      .filter((c) => c.getBoundingClientRect().width > 0);
+  }
+  function restoreBase() {
+    base.forEach((b, c) => {
+      c.style.width = b.w;
+      c.style.height = b.h;
+      c.style.maxWidth = "";
+      c.style.flexShrink = "";
+      c.style.alignSelf = "";
+      c.style.marginLeft = "";
+      c.style.marginRight = "";
+    });
+    base.clear();
+    scale = 1;
+  }
+  // Sets the zoom, keeping the point of the page under (midX, midY)
+  // (client coordinates) fixed on screen.
+  function setScale(next, midX, midY) {
+    next = Math.min(MAX_SCALE, Math.max(1, next));
+    if (next === scale) return;
+    const canvases = liveCanvases();
+    if (!canvases.length) return;
+    if (scale === 1) {
+      base.clear();
+      canvases.forEach((c) => {
+        const r = c.getBoundingClientRect();
+        base.set(c, { w: c.style.width, h: c.style.height, wn: parseFloat(c.style.width) || r.width, hn: parseFloat(c.style.height) || r.height });
+      });
+    }
+    // Anchor = the canvas nearest the focal point, and where in it.
+    let anchor = null, best = Infinity;
+    canvases.forEach((c) => {
+      const r = c.getBoundingClientRect();
+      const d = midY < r.top ? r.top - midY : (midY > r.bottom ? midY - r.bottom : 0);
+      if (d < best) {
+        best = d;
+        anchor = {
+          c,
+          u: Math.min(1, Math.max(0, (midX - r.left) / r.width)),
+          v: Math.min(1, Math.max(0, (midY - r.top) / r.height))
+        };
+      }
+    });
+    if (next === 1) {
+      restoreBase();
+    } else {
+      scale = next;
+      base.forEach((b, c) => {
+        c.style.width = (b.wn * scale) + "px";
+        c.style.height = (b.hn * scale) + "px";
+        c.style.maxWidth = "none";
+        c.style.flexShrink = "0";
+        // Auto margins centre the page when it fits and fall back to the
+        // left edge (still fully scrollable) when it is wider than the view.
+        c.style.alignSelf = "flex-start";
+        c.style.marginLeft = "auto";
+        c.style.marginRight = "auto";
+      });
+    }
+    if (anchor) {
+      const r = anchor.c.getBoundingClientRect();
+      scroller.scrollTop += (r.top + anchor.v * r.height) - midY;
+      scroller.scrollLeft += (r.left + anchor.u * r.width) - midX;
+    }
+    if (scale === 1) scroller.scrollLeft = 0; // back to the normal centred position
+  }
+
+  function dist(t) { return Math.hypot(t[0].clientX - t[1].clientX, t[0].clientY - t[1].clientY) || 1; }
+  function mid(t) { return { x: (t[0].clientX + t[1].clientX) / 2, y: (t[0].clientY + t[1].clientY) / 2 }; }
+
+  function endPinch() {
+    if (!pinching) return;
+    pinching = false;
+    scroller.style.overflow = "";
+    if (scale < 1.02 && scale !== 1) {
+      const r = scroller.getBoundingClientRect();
+      setScale(1, r.left + r.width / 2, r.top + r.height / 2);
+    }
+  }
+  function onTouchStart(e) {
+    if (e.touches.length === 2) {
+      pinching = true;
+      startDist = dist(e.touches);
+      startScale = scale;
+      tapMoved = true;
+      // Native scrolling must not fight the pinch's own repositioning.
+      scroller.style.overflow = "hidden";
+      if (e.cancelable) e.preventDefault();
+    } else if (e.touches.length === 1) {
+      tapMoved = false;
+      tapStartT = Date.now();
+      tapX = e.touches[0].clientX;
+      tapY = e.touches[0].clientY;
+    } else {
+      tapMoved = true;
+    }
+  }
+  function onTouchMove(e) {
+    if (pinching && e.touches.length >= 2) {
+      if (e.cancelable) e.preventDefault();
+      const m = mid(e.touches);
+      setScale(startScale * (dist(e.touches) / startDist), m.x, m.y);
+    } else if (!tapMoved && e.touches.length === 1) {
+      if (Math.hypot(e.touches[0].clientX - tapX, e.touches[0].clientY - tapY) > 10) tapMoved = true;
+    }
+  }
+  function onTouchEnd(e) {
+    if (pinching) {
+      if (e.touches.length < 2) endPinch();
+      return;
+    }
+    if (e.touches.length === 0 && !tapMoved && e.changedTouches.length === 1 && Date.now() - tapStartT < 300) {
+      const t = e.changedTouches[0];
+      const now = Date.now();
+      if (now - lastTap < 300 && Math.hypot(t.clientX - lastTapX, t.clientY - lastTapY) < 40) {
+        lastTap = 0;
+        setScale(scale > 1 ? 1 : DOUBLE_TAP_SCALE, t.clientX, t.clientY);
+      } else {
+        lastTap = now;
+        lastTapX = t.clientX;
+        lastTapY = t.clientY;
+      }
+    }
+  }
+  function onTouchCancel() {
+    tapMoved = true;
+    endPinch();
+  }
+  // Safari's own page-zoom gesture events - suppressed so only our
+  // pinch handling applies inside the viewer.
+  function onGesture(e) { e.preventDefault(); }
+
+  const opts = { passive: false };
+  scroller.addEventListener("touchstart", onTouchStart, opts);
+  scroller.addEventListener("touchmove", onTouchMove, opts);
+  scroller.addEventListener("touchend", onTouchEnd, opts);
+  scroller.addEventListener("touchcancel", onTouchCancel, opts);
+  scroller.addEventListener("gesturestart", onGesture, opts);
+  scroller.addEventListener("gesturechange", onGesture, opts);
+  scroller.addEventListener("gestureend", onGesture, opts);
+
+  return {
+    // Back to the exact original 1x canvas sizes and gesture state.
+    reset() {
+      const wasZoomed = scale !== 1;
+      pinching = false;
+      tapMoved = true;
+      lastTap = 0;
+      scroller.style.overflow = "";
+      restoreBase();
+      scroller.scrollLeft = 0;
+      if (wasZoomed) scroller.scrollTop = 0; // a page opened after zooming starts at its top
+    },
+    // Removes every listener this zoom added and resets all state.
+    detach() {
+      scroller.removeEventListener("touchstart", onTouchStart, opts);
+      scroller.removeEventListener("touchmove", onTouchMove, opts);
+      scroller.removeEventListener("touchend", onTouchEnd, opts);
+      scroller.removeEventListener("touchcancel", onTouchCancel, opts);
+      scroller.removeEventListener("gesturestart", onGesture, opts);
+      scroller.removeEventListener("gesturechange", onGesture, opts);
+      scroller.removeEventListener("gestureend", onGesture, opts);
+      pinching = false;
+      tapMoved = true;
+      lastTap = 0;
+      scroller.style.overflow = "";
+      scroller.style.touchAction = "";
+      restoreBase();
+    }
+  };
+}
+
 async function showPdfDocument(blob, opts) {
   opts = opts || {};
   const title = opts.title || "PDF";
@@ -1973,12 +2172,16 @@ async function showPdfDocument(blob, opts) {
 
   let pdfDoc = null;
   const renderedCanvases = [];
+  let pdfZoom = null;
+  let viewerClosed = false;
 
   // Frees the decoded PDF and every rendered canvas's pixel buffer as
   // soon as the preview closes, rather than leaving them for the
   // garbage collector to get to eventually - matters on iPhone/iPad
   // where a job's PDF can include several photo pages.
   function cleanup() {
+    viewerClosed = true;
+    if (pdfZoom) { pdfZoom.detach(); pdfZoom = null; }
     renderedCanvases.forEach((canvas) => {
       const ctx = canvas.getContext("2d");
       if (ctx) ctx.clearRect(0, 0, canvas.width, canvas.height);
@@ -2032,6 +2235,8 @@ async function showPdfDocument(blob, opts) {
       await page.render({ canvasContext: ctx, viewport: renderViewport }).promise;
       page.cleanup();
     }
+    // Zoom is enabled once every page is drawn (opens at 1x as before).
+    if (!viewerClosed) pdfZoom = attachPdfZoom(pageList);
   } catch (err) {
     console.error(err);
     pageList.innerHTML = "";
@@ -2802,6 +3007,7 @@ async function showAdminPdfDocument(action, adminToken, submissionId, opts) {
   const statusArea = el("div", { class: "help-text", style: "padding:30px;text-align:center;color:#fff;" }, "Loading PDF\u2026");
   const canvas = el("canvas", { class: "pdf-page-canvas", style: "display:none;" });
   const pageArea = el("div", { class: "pdf-page-list" }, [statusArea, canvas]);
+  const pdfZoom = attachPdfZoom(pageArea);
 
   const prevBtn = el("button", { class: "btn btn-outline" }, "\u2039 Previous");
   const pageLabel = el("div", { class: "pdf-page-label" }, "");
@@ -2844,6 +3050,7 @@ async function showAdminPdfDocument(action, adminToken, submissionId, opts) {
   // every page and keep every canvas" approach did.
   function cleanup() {
     closed = true;
+    pdfZoom.detach();
     // Aborts the currently outstanding Admin PDF network request (if
     // any) right away - fetchAdminPdfBytesChunked() and everything it
     // calls thread this same signal all the way down to the actual
@@ -2959,11 +3166,13 @@ async function showAdminPdfDocument(action, adminToken, submissionId, opts) {
 
   prevBtn.addEventListener("click", () => {
     if (isRendering || !pdfDoc || currentPage <= 1) return;
+    pdfZoom.reset(); // each page opens at 1x
     currentPage--;
     renderPage(currentPage);
   });
   nextBtn.addEventListener("click", () => {
     if (isRendering || !pdfDoc || currentPage >= pdfDoc.numPages) return;
+    pdfZoom.reset(); // each page opens at 1x
     currentPage++;
     renderPage(currentPage);
   });
