@@ -2214,7 +2214,13 @@ async function showPdfDocument(blob, opts) {
     // in sequence, not in parallel) to keep peak memory bounded rather
     // than decoding every page's bitmap simultaneously.
     const containerWidth = Math.max(Math.min(overlay.clientWidth || window.innerWidth, 900) - 24, 280);
-    const pixelRatio = Math.min(window.devicePixelRatio || 1, 2);
+    const isSmallPortrait =
+      window.innerWidth < 500 &&
+      window.innerHeight > window.innerWidth;
+    const pixelRatio = Math.min(
+      window.devicePixelRatio || 1,
+      isSmallPortrait ? 3 : 2
+    );
 
     for (let pageNum = 1; pageNum <= pdfDoc.numPages; pageNum++) {
       const page = await pdfDoc.getPage(pageNum);
@@ -3120,7 +3126,13 @@ async function showAdminPdfDocument(action, adminToken, submissionId, opts) {
       page = await pdfDoc.getPage(pageNum);
       if (closed) return;
       const containerWidth = Math.max(Math.min(overlay.clientWidth || window.innerWidth, 900) - 24, 280);
-      const pixelRatio = Math.min(window.devicePixelRatio || 1, 2);
+      const isSmallPortrait =
+        window.innerWidth < 500 &&
+        window.innerHeight > window.innerWidth;
+      const pixelRatio = Math.min(
+        window.devicePixelRatio || 1,
+        isSmallPortrait ? 3 : 2
+      );
       const baseViewport = page.getViewport({ scale: 1 });
       const fitScale = containerWidth / baseViewport.width;
       const displayViewport = page.getViewport({ scale: fitScale });
