@@ -1042,8 +1042,15 @@ function renderJobForm(job, schema, opts) {
   schema.sections.forEach((section) => {
     body.appendChild(el("div", { class: "section-title" }, section.title));
     const grid = el("div", { class: "field-grid" });
+    const acGroup = contactGroupForSection(section);
+    const acInputs = {};
     section.fields.forEach((f) => {
-      grid.appendChild(fieldBlock(f, job.fields[f.id] || "", (v) => { job.fields[f.id] = v; scheduleAutosave(); }));
+      const block = fieldBlock(f, job.fields[f.id] || "", (v) => { job.fields[f.id] = v; scheduleAutosave(); });
+      grid.appendChild(block);
+      if (acGroup) {
+        acInputs[f.id] = block.querySelector("input");
+        attachContactAutocomplete(block, f.id, job, acGroup, acInputs);
+      }
     });
     body.appendChild(grid);
   });
@@ -1115,6 +1122,240 @@ function renderJobForm(job, schema, opts) {
 
   wrap.appendChild(body);
   return wrap;
+}
+
+// ---------------------------------------------------------------
+// Saved contact history / autocomplete (local to this browser only)
+// ---------------------------------------------------------------
+// Remembers REUSABLE business/designer contact details from jobs that
+// were successfully submitted, and offers them back as suggestions.
+// Stored only in localStorage under one key (never IndexedDB, never the
+// backend), shared by everyone using this tablet/browser. Only the
+// whitelisted field ids below are ever stored, searched or filled -
+// Project Information (jobsite / project location) and End-User fields
+// are not in any list here, so they can never be saved, suggested or
+// autofilled. Every storage access is wrapped so a failure simply acts
+// like "no history" and never affects the rest of the app.
+//   { emails: ["a@b.com", ...],        // shared, most recent first
+//     soldTo:  [{ k: key, f: {designFirm, contact, ...} }, ...],
+//     designer:[{ k: key, f: {designerFirstLast, ...} }, ...] }
+const MWT_CONTACT_HISTORY_KEY = "mwt_contact_history_v1";
+const CONTACT_GROUPS = {
+  soldTo: {
+    key: "soldTo",
+    anchor: "designFirm",
+    emailId: "email",
+    fields: ["designFirm", "contact", "street", "cityStateZip", "phone", "cell", "email"],
+    triggers: ["designFirm", "contact", "street", "cityStateZip", "phone", "cell", "email"],
+    keyFields: ["designFirm", "contact", "email"]
+  },
+  designer: {
+    key: "designer",
+    anchor: "designerFirstLast",
+    emailId: "designerEmail",
+    fields: ["designerFirstLast", "designerCell", "designerEmail", "designerAddress", "designerCity", "designerZip"],
+    triggers: ["designerFirstLast", "designerCell", "designerEmail", "designerAddress"],
+    keyFields: ["designerFirstLast", "designerEmail"]
+  }
+};
+const CONTACT_SUGGEST_RECENT = 15;
+const CONTACT_SUGGEST_SEARCH = 30;
+
+function contactHistoryRead() {
+  const out = { emails: [], soldTo: [], designer: [] };
+  try {
+    const raw = window.localStorage.getItem(MWT_CONTACT_HISTORY_KEY);
+    if (!raw) return out;
+    const d = JSON.parse(raw);
+    if (!d || typeof d !== "object") return out;
+    if (Array.isArray(d.emails)) {
+      d.emails.forEach((e) => { if (typeof e === "string" && e.trim()) out.emails.push(e.trim()); });
+    }
+    ["soldTo", "designer"].forEach((k) => {
+      if (!Array.isArray(d[k])) return;
+      d[k].forEach((p) => {
+        if (!p || typeof p.k !== "string" || !p.f || typeof p.f !== "object") return;
+        const f = {};
+        CONTACT_GROUPS[k].fields.forEach((id) => { if (typeof p.f[id] === "string") f[id] = p.f[id]; });
+        out[k].push({ k: p.k, f });
+      });
+    });
+  } catch (e) {
+    return { emails: [], soldTo: [], designer: [] };
+  }
+  return out;
+}
+
+function contactHistoryWrite(h) {
+  try {
+    window.localStorage.setItem(MWT_CONTACT_HISTORY_KEY, JSON.stringify(h));
+  } catch (e) { /* storage unavailable/full - history simply isn't kept */ }
+}
+
+// Called ONLY from the confirmed-success branch of doSubmit() (first
+// submission or resubmission). Never throws.
+function saveContactHistoryFromJob(job) {
+  try {
+    const schema = getFormSchema(job.formType);
+    if (!schema || !job || !job.fields) return;
+    const h = contactHistoryRead();
+    const addEmail = (raw) => {
+      const e = (raw || "").toString().trim();
+      if (!e || !isValidEmailFormat(e)) return;
+      h.emails = h.emails.filter((x) => x.toLowerCase() !== e.toLowerCase());
+      h.emails.unshift(e);
+    };
+    (schema.sections || []).forEach((section) => {
+      const ids = new Set(section.fields.map((f) => f.id));
+      const group = ids.has(CONTACT_GROUPS.soldTo.anchor) ? CONTACT_GROUPS.soldTo
+        : ids.has(CONTACT_GROUPS.designer.anchor) ? CONTACT_GROUPS.designer : null;
+      if (!group) return;
+      const vals = {};
+      group.fields.forEach((id) => {
+        if (ids.has(id)) vals[id] = (job.fields[id] || "").toString().trim();
+      });
+      const keyParts = group.keyFields.map((id) => (vals[id] || "").toLowerCase());
+      if (keyParts.every((p) => !p)) return; // nothing identifying to remember
+      // Conservative identity: same firm + contact + email (or designer
+      // name + email). Two contacts at one firm stay separate profiles.
+      const k = keyParts.join("|");
+      h[group.key] = h[group.key].filter((p) => p.k !== k);
+      h[group.key].unshift({ k, f: vals });
+      addEmail(vals[group.emailId]);
+    });
+    contactHistoryWrite(h);
+  } catch (e) { /* never affects submission */ }
+}
+
+function contactGroupForSection(section) {
+  const ids = new Set((section.fields || []).map((f) => f.id));
+  if (ids.has(CONTACT_GROUPS.soldTo.anchor)) return CONTACT_GROUPS.soldTo;
+  if (ids.has(CONTACT_GROUPS.designer.anchor)) return CONTACT_GROUPS.designer;
+  return null;
+}
+
+let _contactAcActive = null; // the one open dropdown, if any
+
+function attachContactAutocomplete(block, fieldId, job, group, inputs) {
+  const input = inputs[fieldId];
+  if (!input || group.triggers.indexOf(fieldId) < 0) return;
+  const isEmail = fieldId === group.emailId;
+  input.setAttribute("autocomplete", "off");
+  block.classList.add("ac-host");
+
+  let dd = null, hist = null, pointerDown = false, blurTimer = null, upTimer = null;
+
+  function close() {
+    clearTimeout(blurTimer);
+    clearTimeout(upTimer);
+    pointerDown = false;
+    document.removeEventListener("pointerdown", onDocPointerDown, true);
+    if (dd) { dd.remove(); dd = null; }
+    if (_contactAcActive && _contactAcActive.owner === input) _contactAcActive = null;
+  }
+  function onDocPointerDown(e) {
+    if (!dd || dd.contains(e.target) || e.target === input) return;
+    close();
+  }
+  function profileText(p) {
+    return group.fields.map((id) => p.f[id] || "").join("\n").toLowerCase();
+  }
+  function profileLines(p) {
+    const f = p.f;
+    if (group.key === "soldTo") {
+      return {
+        title: f.designFirm || f.contact || f.email || "",
+        sub: [f.designFirm ? f.contact : "", f.email, f.cityStateZip].filter(Boolean).join(" · ")
+      };
+    }
+    return {
+      title: f.designerFirstLast || f.designerEmail || "",
+      sub: [f.designerFirstLast ? f.designerEmail : "", f.designerCity, f.designerCell].filter(Boolean).join(" · ")
+    };
+  }
+  function finish() {
+    close();
+    try { input.blur(); } catch (e) { /* ignore */ }
+  }
+  function pickEmail(e) {
+    input.value = e;
+    job.fields[fieldId] = e; // ONLY this field
+    scheduleAutosave();
+    finish();
+  }
+  function pickProfile(p) {
+    // Only NONBLANK saved values, only fields of this same group/section.
+    group.fields.forEach((id) => {
+      const v = (p.f[id] || "").trim();
+      if (v && inputs[id]) {
+        inputs[id].value = v;
+        job.fields[id] = v;
+      }
+    });
+    scheduleAutosave();
+    finish();
+  }
+  function addRow(parent, title, sub, onPick) {
+    const row = el("div", { class: "ac-item", role: "option" }, [
+      el("div", { class: "ac-title" }, title),
+      sub ? el("div", { class: "ac-sub" }, sub) : null
+    ]);
+    row.addEventListener("click", (ev) => { ev.preventDefault(); onPick(); });
+    parent.appendChild(row);
+  }
+  function refresh() {
+    if (!dd) return;
+    const q = input.value.trim().toLowerCase();
+    const search = q.length >= 2;
+    const lim = search ? CONTACT_SUGGEST_SEARCH : CONTACT_SUGGEST_RECENT;
+    const emails = isEmail
+      ? (search ? hist.emails.filter((e) => e.toLowerCase().indexOf(q) >= 0) : hist.emails).slice(0, lim)
+      : [];
+    const profiles = (search ? hist[group.key].filter((p) => profileText(p).indexOf(q) >= 0) : hist[group.key]).slice(0, lim);
+    dd.innerHTML = "";
+    if (!emails.length && !profiles.length) { dd.style.display = "none"; return; }
+    dd.style.display = "";
+    const headings = emails.length && profiles.length;
+    if (emails.length) {
+      if (headings) dd.appendChild(el("div", { class: "ac-group" }, "Saved emails"));
+      emails.forEach((e) => addRow(dd, e, "", () => pickEmail(e)));
+    }
+    if (profiles.length) {
+      if (headings) dd.appendChild(el("div", { class: "ac-group" }, "Saved contacts"));
+      profiles.forEach((p) => {
+        const t = profileLines(p);
+        addRow(dd, t.title, t.sub, () => pickProfile(p));
+      });
+    }
+  }
+  function open() {
+    if (_contactAcActive && _contactAcActive.owner !== input) _contactAcActive.close();
+    if (!dd) {
+      hist = contactHistoryRead();
+      dd = el("div", { class: "ac-dropdown", role: "listbox" });
+      dd.style.top = (input.offsetTop + input.offsetHeight + 2) + "px";
+      // Keep focus on the input while the list is touched, so a tap on
+      // a suggestion is never lost to the input's blur.
+      dd.addEventListener("mousedown", (ev) => ev.preventDefault());
+      dd.addEventListener("pointerdown", () => { pointerDown = true; clearTimeout(upTimer); });
+      const release = () => { clearTimeout(upTimer); upTimer = setTimeout(() => { pointerDown = false; }, 400); };
+      dd.addEventListener("pointerup", release);
+      dd.addEventListener("pointercancel", release);
+      block.appendChild(dd);
+      document.addEventListener("pointerdown", onDocPointerDown, true);
+      _contactAcActive = { owner: input, close };
+    }
+    refresh();
+  }
+
+  input.addEventListener("focus", open);
+  input.addEventListener("click", () => { if (!dd) open(); });
+  input.addEventListener("input", () => { if (dd) refresh(); else open(); });
+  input.addEventListener("blur", () => {
+    clearTimeout(blurTimer);
+    blurTimer = setTimeout(() => { if (!pointerDown) close(); }, 200);
+  });
+  input.addEventListener("keydown", (e) => { if (e.key === "Escape") close(); });
 }
 
 function fieldBlock(f, value, onChange) {
@@ -3554,6 +3795,9 @@ async function doSubmit(job, schema) {
         job.status = "submitted";
         job.submittedAt = nowStamp();
         job.revision = (job.revision || 0) + 1;
+        // Local-only saved-contact history: updated here, at the confirmed
+        // success point only. Never throws.
+        saveContactHistoryFromJob(job);
         try {
           await persistJob(job, { silent: true });
           toast("Submitted successfully.", "success");
