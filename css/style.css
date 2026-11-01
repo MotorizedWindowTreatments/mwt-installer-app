@@ -1259,7 +1259,7 @@ body.pdf-viewer-open {
   margin-left: 6px;
 }
 
-/* ---------------- Saved-contact autocomplete dropdown ---------------- */
+/* ---------------- Designer Email suggestion dropdown ---------------- */
 .field.ac-host { position: relative; }
 .ac-dropdown {
   position: absolute;
@@ -1273,13 +1273,6 @@ body.pdf-viewer-open {
   overflow-y: auto;
   -webkit-overflow-scrolling: touch;
 }
-.ac-group {
-  padding: 6px 12px 2px;
-  font-size: 11px;
-  font-weight: 700;
-  text-transform: uppercase;
-  color: var(--mwt-muted);
-}
 .ac-item {
   padding: 9px 12px;
   min-height: var(--tap);
@@ -1289,4 +1282,3 @@ body.pdf-viewer-open {
 .ac-item:first-child { border-top: none; }
 .ac-item:active { background: #f1f2f4; }
 .ac-title { font-size: 15px; font-weight: 600; }
-.ac-sub { font-size: 12.5px; color: var(--mwt-muted); }
