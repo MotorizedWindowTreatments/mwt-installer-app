@@ -1042,11 +1042,17 @@ function renderJobForm(job, schema, opts) {
   schema.sections.forEach((section) => {
     body.appendChild(el("div", { class: "section-title" }, section.title));
     const grid = el("div", { class: "field-grid" });
+    const profileGroup = contactProfileGroupFor(section);
+    const profileInputs = {}; // fieldId -> input, for explicit profile fill
     section.fields.forEach((f) => {
       const block = fieldBlock(f, job.fields[f.id] || "", (v) => { job.fields[f.id] = v; scheduleAutosave(); });
       grid.appendChild(block);
-      if (f.type === "email" && DESIGNER_EMAIL_FIELD_IDS.indexOf(f.id) >= 0) {
-        attachDesignerEmailAutocomplete(block, block.querySelector("input"), f.id, job);
+      profileInputs[f.id] = block.querySelector("input");
+      const isEmailAc = f.type === "email" && DESIGNER_EMAIL_FIELD_IDS.indexOf(f.id) >= 0;
+      const isProfileAc = !!profileGroup && profileGroup.triggers.indexOf(f.id) >= 0;
+      if (isEmailAc || isProfileAc) {
+        attachDesignerEmailAutocomplete(block, block.querySelector("input"), f.id, job,
+          isProfileAc ? { group: profileGroup, inputs: profileInputs } : null, isEmailAc);
       }
     });
     body.appendChild(grid);
@@ -1159,12 +1165,12 @@ function saveDesignerEmailFromJob(job) {
 
 let _designerEmailAcActive = null; // the one open dropdown, if any
 
-function attachDesignerEmailAutocomplete(block, input, fieldId, job) {
+function attachDesignerEmailAutocomplete(block, input, fieldId, job, profileCtx, withEmails) {
   if (!input) return;
   input.setAttribute("autocomplete", "off");
   block.classList.add("ac-host");
 
-  let dd = null, hist = null, pointerDown = false, blurTimer = null, upTimer = null;
+  let dd = null, hist = null, profiles = null, pointerDown = false, blurTimer = null, upTimer = null;
 
   function close() {
     clearTimeout(blurTimer);
@@ -1185,15 +1191,45 @@ function attachDesignerEmailAutocomplete(block, input, fieldId, job) {
     close();
     try { input.blur(); } catch (e) { /* ignore */ }
   }
+  // Explicit profile selection only: fills the nonblank saved values of
+  // this one group (never blanks, never anything outside the group).
+  function pickProfile(p) {
+    const g = profileCtx.group;
+    g.fields.forEach((id) => {
+      const v = (p[id] || "").trim();
+      const inp = profileCtx.inputs[id];
+      if (!v || !inp) return;
+      inp.value = v;
+      job.fields[id] = v;
+    });
+    scheduleAutosave();
+    close();
+    try { input.blur(); } catch (e) { /* ignore */ }
+  }
   function refresh() {
     if (!dd) return;
     const q = input.value.trim().toLowerCase();
     const search = q.length >= 2;
-    const list = (search ? hist.filter((e) => e.toLowerCase().indexOf(q) >= 0) : hist)
-      .slice(0, search ? DESIGNER_EMAIL_SUGGEST_SEARCH : DESIGNER_EMAIL_SUGGEST_RECENT);
+    const emails = !withEmails ? [] :
+      (search ? hist.filter((e) => e.toLowerCase().indexOf(q) >= 0) : hist)
+        .slice(0, search ? DESIGNER_EMAIL_SUGGEST_SEARCH : DESIGNER_EMAIL_SUGGEST_RECENT);
+    const profs = !profileCtx ? [] :
+      (search ? profiles.filter((p) => contactProfileMatches(profileCtx.group, p, q)) : profiles)
+        .slice(0, search ? CONTACT_PROFILE_SUGGEST_SEARCH : CONTACT_PROFILE_SUGGEST_RECENT);
     dd.innerHTML = "";
-    dd.style.display = list.length ? "" : "none";
-    list.forEach((e) => {
+    dd.style.display = (emails.length || profs.length) ? "" : "none";
+    if (profs.length && emails.length) dd.appendChild(el("div", { class: "ac-heading" }, "Saved contacts"));
+    profs.forEach((p) => {
+      const t = contactProfileDisplay(profileCtx.group, p);
+      const row = el("div", { class: "ac-item", role: "option" }, [
+        el("div", { class: "ac-title" }, t.title),
+        t.sub ? el("div", { class: "ac-sub" }, t.sub) : null
+      ]);
+      row.addEventListener("click", (ev) => { ev.preventDefault(); pickProfile(p); });
+      dd.appendChild(row);
+    });
+    if (profs.length && emails.length) dd.appendChild(el("div", { class: "ac-heading" }, "Email only"));
+    emails.forEach((e) => {
       const row = el("div", { class: "ac-item", role: "option" }, el("div", { class: "ac-title" }, e));
       row.addEventListener("click", (ev) => { ev.preventDefault(); pick(e); });
       dd.appendChild(row);
@@ -1203,7 +1239,8 @@ function attachDesignerEmailAutocomplete(block, input, fieldId, job) {
     clearTimeout(blurTimer); // a pending close from an earlier blur must not shut this reopened list
     if (_designerEmailAcActive && _designerEmailAcActive.owner !== input) _designerEmailAcActive.close();
     if (!dd) {
-      hist = designerEmailHistoryRead();
+      hist = withEmails ? designerEmailHistoryRead() : [];
+      profiles = profileCtx ? contactProfilesRead(profileCtx.group.key) : [];
       dd = el("div", { class: "ac-dropdown", role: "listbox" });
       dd.style.top = (input.offsetTop + input.offsetHeight + 2) + "px";
       // Keep focus on the input while the list is touched, so a tap on
@@ -1232,9 +1269,110 @@ function attachDesignerEmailAutocomplete(block, input, fieldId, job) {
   input.addEventListener("keydown", (e) => { if (e.key === "Escape") close(); });
 }
 
-// One-time tidy-up: removes the data written by the earlier, larger
-// saved-contact build (if it was ever installed on this browser).
-try { window.localStorage.removeItem("mwt_contact_history_v1"); } catch (e) { /* ignore */ }
+// ---------------------------------------------------------------
+// Saved reusable contact profiles (local to this browser only)
+// ---------------------------------------------------------------
+// Two separate kinds, never mixed:
+//   soldTo   - the Sold To / Bill To business contact
+//   designer - the Designer block of the Service/Retrofit/Cut-Down form
+// Only the reusable fields listed below are ever stored. Jobsite /
+// Project Information and End-User fields are not in any list, so they
+// are never saved, searched, suggested or filled. Written only from the
+// confirmed-success branch of doSubmit(). Every storage access is
+// wrapped: any failure just behaves as "no saved contacts".
+const MWT_CONTACT_PROFILES_KEY = "mwt_contact_history_v2";
+const CONTACT_PROFILE_SUGGEST_RECENT = 15;
+const CONTACT_PROFILE_SUGGEST_SEARCH = 30;
+const CONTACT_PROFILE_GROUPS = {
+  soldTo: {
+    key: "soldTo",
+    marker: "designFirm", // section is Sold To / Bill To if it has this field
+    fields: ["designFirm", "contact", "street", "cityStateZip", "phone", "cell", "email"],
+    triggers: ["designFirm", "contact", "street", "cityStateZip", "phone", "cell", "email"],
+    identity: ["designFirm", "contact", "email"],
+    titleField: "designFirm", subFields: ["contact", "email"], altTitleField: "contact"
+  },
+  designer: {
+    key: "designer",
+    marker: "designerFirstLast",
+    fields: ["designerFirstLast", "designerCell", "designerEmail", "designerAddress", "designerCity", "designerZip"],
+    triggers: ["designerFirstLast", "designerCell", "designerEmail", "designerAddress"],
+    identity: ["designerFirstLast", "designerEmail"],
+    titleField: "designerFirstLast", subFields: ["designerEmail", "designerCity"], altTitleField: "designerEmail"
+  }
+};
+
+function contactProfileGroupFor(section) {
+  const ids = (section.fields || []).map((f) => f.id);
+  if (ids.indexOf(CONTACT_PROFILE_GROUPS.soldTo.marker) >= 0) return CONTACT_PROFILE_GROUPS.soldTo;
+  if (ids.indexOf(CONTACT_PROFILE_GROUPS.designer.marker) >= 0) return CONTACT_PROFILE_GROUPS.designer;
+  return null;
+}
+
+function contactProfilesReadAll() {
+  const out = { soldTo: [], designer: [] };
+  try {
+    const d = JSON.parse(window.localStorage.getItem(MWT_CONTACT_PROFILES_KEY) || "{}");
+    if (!d || typeof d !== "object") return out;
+    Object.keys(out).forEach((k) => {
+      if (!Array.isArray(d[k])) return;
+      const fields = CONTACT_PROFILE_GROUPS[k].fields;
+      d[k].forEach((p) => {
+        if (!p || typeof p !== "object") return;
+        const clean = {};
+        fields.forEach((id) => { clean[id] = typeof p[id] === "string" ? p[id].trim() : ""; });
+        out[k].push(clean);
+      });
+    });
+  } catch (e) { return { soldTo: [], designer: [] }; }
+  return out;
+}
+
+function contactProfilesRead(kind) {
+  return contactProfilesReadAll()[kind] || [];
+}
+
+function contactProfileIdentity(group, p) {
+  return group.identity.map((id) => (p[id] || "").trim().toLowerCase()).join("|");
+}
+
+// Called ONLY from the confirmed-success branch of doSubmit() (first
+// submission or resubmission). Never throws.
+function saveContactProfilesFromJob(job, schema) {
+  try {
+    const all = contactProfilesReadAll();
+    (schema.sections || []).forEach((section) => {
+      const group = contactProfileGroupFor(section);
+      if (!group) return;
+      const p = {};
+      group.fields.forEach((id) => { p[id] = String((job.fields || {})[id] || "").trim(); });
+      if (!p[group.titleField] && !p[group.altTitleField]) return; // nothing to identify it by
+      const ident = contactProfileIdentity(group, p);
+      const list = all[group.key];
+      const i = list.findIndex((x) => contactProfileIdentity(group, x) === ident);
+      if (i >= 0) {
+        const old = list.splice(i, 1)[0];
+        // newest submitted values win; a blank never erases a stored value
+        group.fields.forEach((id) => { if (!p[id]) p[id] = old[id] || ""; });
+      }
+      list.unshift(p);
+    });
+    window.localStorage.setItem(MWT_CONTACT_PROFILES_KEY, JSON.stringify(all));
+  } catch (err) { /* storage unavailable/full - profiles simply aren't kept */ }
+}
+
+function contactProfileMatches(group, p, q) {
+  for (let i = 0; i < group.fields.length; i++) {
+    if ((p[group.fields[i]] || "").toLowerCase().indexOf(q) >= 0) return true;
+  }
+  return false;
+}
+
+function contactProfileDisplay(group, p) {
+  const title = p[group.titleField] || p[group.altTitleField] || "";
+  const sub = group.subFields.map((id) => p[id]).filter((v) => v && v !== title).join(" \u00b7 ");
+  return { title, sub };
+}
 
 function fieldBlock(f, value, onChange) {
   const wrapper = el("div", { class: "field" + (f.fullWidth ? " full" : "") });
@@ -3676,6 +3814,9 @@ async function doSubmit(job, schema) {
         // Local-only Designer Email history: updated here, at the
         // confirmed success point only. Never throws.
         saveDesignerEmailFromJob(job);
+        // Local-only reusable contact profiles: same confirmed-success
+        // point, nothing else. Never throws.
+        saveContactProfilesFromJob(job, schema);
         try {
           await persistJob(job, { silent: true });
           toast("Submitted successfully.", "success");
