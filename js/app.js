@@ -301,6 +301,33 @@ function _latestEditRevision(jobId) {
   return _editRevisionByJobId.get(jobId) || 0;
 }
 
+// Diagnostic logging only for a failed save: error name/message, job id,
+// photo count and approximate photo payload size (sum of dataUrl string
+// lengths). Deliberately logs no field values, names, addresses or
+// photo contents. Never throws.
+function logSaveFailureDetails(job, err) {
+  try {
+    let photos = 0, unsavedPhotos = 0, approxBytes = 0;
+    const count = (p) => {
+      if (!p || !p.id) return;
+      photos++;
+      if (p.dataUrl) { approxBytes += p.dataUrl.length; if (!p._assetHydrated) unsavedPhotos++; }
+    };
+    (job.lineItems || []).forEach((row) => (row.photos || []).forEach(count));
+    (job.attachments || []).forEach(count);
+    console.error("Save failure details:", {
+      errorName: err && err.name,
+      errorMessage: err && err.message,
+      recoverySnapshotSaved: err && err.recoverySaved,
+      jobId: job && job.id,
+      lineItems: (job.lineItems || []).length,
+      photos,
+      photosNotYetStored: unsavedPhotos,
+      approxPhotoMB: Math.round(approxBytes / 1048576 * 10) / 10
+    });
+  } catch (e) { /* diagnostics must never affect saving */ }
+}
+
 async function doPersistJobOnce(job, opts) {
   job.lastModified = nowStamp();
   job.displayName = computeDisplayName(job);
@@ -329,11 +356,28 @@ async function doPersistJobOnce(job, opts) {
     // data - the installer's edits stay exactly as they are on screen
     // and in state.currentJob.
     console.error("Save failed:", err);
+    logSaveFailureDetails(job, err);
     if (canUpdateSharedUi()) {
       setSaveIndicator("error");
     }
     if (!opts.silent) {
-      toast("This job could not be saved. Please keep this job open and do not close or refresh the app.", "error");
+      // db.js tags err.recoverySaved === true only when the lightweight
+      // measurements recovery snapshot genuinely committed before the full
+      // save failed. Only then is it accurate to say measurements were
+      // kept; the indicator above still shows the error state (the full
+      // job, including photos, was NOT saved), and the failure is still
+      // thrown below exactly as before.
+      if (err && err.recoverySaved === true) {
+        const storageFull = err.name === "QuotaExceededError" || /quota|storage.*full/i.test(String(err.message || ""));
+        toast(
+          storageFull
+            ? "Measurements and job information were saved, but photos could not be stored because device storage is full. Please keep the app open until photos are backed up."
+            : "Measurements and job information were saved to a recovery copy, but the full save (including photos) did not complete. Please keep the app open until photos are backed up.",
+          "error"
+        );
+      } else {
+        toast("This job could not be saved. Please keep this job open and do not close or refresh the app.", "error");
+      }
     }
     throw err;
   }
