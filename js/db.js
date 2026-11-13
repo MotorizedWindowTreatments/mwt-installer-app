@@ -144,7 +144,12 @@ function _watchTransaction(tx, timeoutMs, onCompleteValue) {
     }
 
     tx.oncomplete = () => finish(resolve, onCompleteValue ? onCompleteValue() : undefined);
-    tx.onerror = () => finish(reject, tx.error || new Error("Save failed."));
+    // A request-level error reaches tx.onerror BEFORE the transaction's
+    // own abort, and at that moment tx.error is still null - so read the
+    // real DOMException (e.g. QuotaExceededError) from the failing
+    // request (e.target.error) rather than replacing it with a generic
+    // Error that hides what actually went wrong.
+    tx.onerror = (e) => finish(reject, (e && e.target && e.target.error) || tx.error || new Error("Save failed."));
     tx.onabort = () => finish(reject, tx.error || new Error("Save was aborted (this can happen if the tablet's storage is full, or the save timed out)."));
   });
 }
@@ -230,6 +235,16 @@ function _pickNewerBase(job, recovery) {
   return recTime > jobTime ? recovery : job;
 }
 
+// Records on a thrown save error whether the lightweight jobRecovery
+// snapshot (measurements/text, no photo binary) DID commit before the
+// full save failed, so the caller can tell the installer accurately
+// what is and is not protected. Purely informational - never changes
+// what is thrown or stored.
+function _tagSaveError(err, recoverySaved) {
+  try { if (err && typeof err === "object") err.recoverySaved = !!recoverySaved; } catch (e) { /* ignore */ }
+  return err;
+}
+
 const MwtDB = {
   // Splits any new/changed photo Base64 data out into "jobAssets" and
   // writes only a lightweight job record to "jobs" - both in the SAME
@@ -272,6 +287,7 @@ const MwtDB = {
     // timeout) is logged but does not block the main save attempt
     // below from still being tried - matching the existing recovery
     // best-effort design.
+    let recoverySaved = false;
     const recoverySnapshot = _buildLightweightSnapshot(job);
     try {
       let rtx;
@@ -282,63 +298,74 @@ const MwtDB = {
       }
       rtx.objectStore(MWT_STORE_JOB_RECOVERY).put(recoverySnapshot);
       await _watchTransaction(rtx, SAVE_TRANSACTION_TIMEOUT_MS);
+      recoverySaved = true;
     } catch (recErr) {
       console.error("Lightweight measurement recovery snapshot failed to save (continuing to attempt the full save):", recErr);
     }
 
     // --- Step 2: the full jobs+jobAssets write, also watchdog-bounded.
-    const items = _collectAssetItems(job);
-    const currentIds = new Set(items.map((i) => i.id));
-    const assetsToWrite = items
-      .filter((i) => i.dataUrl && !i._assetHydrated)
-      .map((i) => ({ id: i.id, jobId: job.id, name: i.name, type: i.type, size: i.size, dataUrl: i.dataUrl }));
-
-    const lightweightJob = _buildLightweightSnapshot(job);
-
-    let tx;
+    // Any failure here is tagged with whether the recovery snapshot above
+    // already committed (see _tagSaveError), then rethrown unchanged.
+    let tx = null;
     try {
+      const items = _collectAssetItems(job);
+      const currentIds = new Set(items.map((i) => i.id));
+      const assetsToWrite = items
+        .filter((i) => i.dataUrl && !i._assetHydrated)
+        .map((i) => ({ id: i.id, jobId: job.id, name: i.name, type: i.type, size: i.size, dataUrl: i.dataUrl }));
+
+      const lightweightJob = _buildLightweightSnapshot(job);
+
       tx = db.transaction([MWT_STORE_JOBS, MWT_STORE_JOB_ASSETS], "readwrite");
-    } catch (err) {
-      throw err;
-    }
 
-    tx.objectStore(MWT_STORE_JOBS).put(lightweightJob);
+      tx.objectStore(MWT_STORE_JOBS).put(lightweightJob);
 
-    const assetStore = tx.objectStore(MWT_STORE_JOB_ASSETS);
-    assetsToWrite.forEach((a) => assetStore.put(a));
+      const assetStore = tx.objectStore(MWT_STORE_JOB_ASSETS);
+      assetsToWrite.forEach((a) => assetStore.put(a));
 
-    // Prune any asset rows for this job that are no longer referenced
-    // (e.g. the installer removed a photo since the last save) - scoped
-    // to just this job's own assets via the jobId index, not a scan of
-    // the whole store, so this stays cheap even with many other jobs
-    // saved on the same tablet.
-    const idx = assetStore.index("jobId");
-    const cursorReq = idx.openCursor(IDBKeyRange.only(job.id));
-    cursorReq.onsuccess = (e) => {
-      const cursor = e.target.result;
-      if (cursor) {
-        if (!currentIds.has(cursor.value.id)) {
-          cursor.delete();
+      // Prune any asset rows for this job that are no longer referenced
+      // (e.g. the installer removed a photo since the last save) - scoped
+      // to just this job's own assets via the jobId index, not a scan of
+      // the whole store, so this stays cheap even with many other jobs
+      // saved on the same tablet.
+      const idx = assetStore.index("jobId");
+      const cursorReq = idx.openCursor(IDBKeyRange.only(job.id));
+      cursorReq.onsuccess = (e) => {
+        const cursor = e.target.result;
+        if (cursor) {
+          if (!currentIds.has(cursor.value.id)) {
+            cursor.delete();
+          }
+          cursor.continue();
         }
-        cursor.continue();
-      }
-    };
+      };
 
-    // Resolves with the ORIGINAL (full, still-hydrated) job object the
-    // caller passed in - not the lightweight record actually written -
-    // so the rest of the app keeps working with complete in-memory
-    // data exactly as before. onCompleteValue only runs after the
-    // transaction has genuinely committed, marking every asset that
-    // was actually written this round as successfully stored - this is
-    // what stops those same photos from being rewritten on the NEXT
-    // save within the same session.
-    return _watchTransaction(tx, SAVE_TRANSACTION_TIMEOUT_MS, () => {
-      assetsToWrite.forEach((a) => {
-        const original = items.find((i) => i.id === a.id);
-        if (original) _markAssetHydrated(original);
+      // Resolves with the ORIGINAL (full, still-hydrated) job object the
+      // caller passed in - not the lightweight record actually written -
+      // so the rest of the app keeps working with complete in-memory
+      // data exactly as before. onCompleteValue only runs after the
+      // transaction has genuinely committed, marking every asset that
+      // was actually written this round as successfully stored - this is
+      // what stops those same photos from being rewritten on the NEXT
+      // save within the same session.
+      return await _watchTransaction(tx, SAVE_TRANSACTION_TIMEOUT_MS, () => {
+        assetsToWrite.forEach((a) => {
+          const original = items.find((i) => i.id === a.id);
+          if (original) _markAssetHydrated(original);
+        });
+        return job;
       });
-      return job;
-    });
+    } catch (err) {
+      // A synchronous throw part-way through queuing the writes above
+      // (e.g. DataCloneError from put()) would otherwise leave the
+      // transaction open to auto-commit with only SOME of the writes
+      // (a jobs record pointing at assets that were never written).
+      // Abort it explicitly so the heavy write stays all-or-nothing.
+      // Aborting only discards THIS transaction's own pending writes -
+      // nothing already committed is touched.
+      try { if (tx) tx.abort(); } catch (abortErr) { /* already finished - ignore */ }
+      throw _tagSaveError(err, recoverySaved);
+    }
   },
 
   // Full read - returns the job with every photo's dataUrl present,
